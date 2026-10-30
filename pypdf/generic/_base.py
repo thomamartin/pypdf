@@ -26,6 +26,7 @@
 # POSSIBILITY OF SUCH DAMAGE.
 import binascii
 import codecs
+import functools
 import hashlib
 import re
 import sys
@@ -803,6 +804,8 @@ class NameObject(str, PdfObject):  # noqa: SLOT000
     def write_to_stream(self, stream: StreamType) -> None:
         stream.write(self.renumber())
 
+    # Documents use few distinct names very often, and names are small.
+    @functools.lru_cache(maxsize=4096)  # noqa: B019
     def renumber(self) -> bytes:
         out = self[0].encode("utf-8")
         if out != b"/":

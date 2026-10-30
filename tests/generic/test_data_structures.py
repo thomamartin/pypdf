@@ -1,9 +1,11 @@
 """Test the pypdf.generic._data_structures module."""
+import contextlib
 import subprocess
 import sys
 from collections.abc import Callable
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -914,3 +916,101 @@ def test_dictionary_object__clone__cycle_detection() -> None:
     writer = PdfWriter()
     writer.append(BytesIO(data))
     assert len(writer.pages) == 1
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"q 1 0 0 1 72 720 cm BT /F1 12 Tf 10 20 Td (Hello) Tj ET Q",
+        b"[(A) -20 (B\\)) 1.5 <4142>] TJ",
+        b"(nested (parens)) Tj <414> Tj < 41 42 > Tj",
+        b"(a) ' 1 2 (b) \"",
+        b"1.2.3 m -- l +.5 .5 5. re",
+        b"1.5w 0 0m",
+        b"% comment\n1 0 0 rg % another\n",
+        b"/Name#20x gs /P <</MCID 0>> BDC EMC",
+        b"BI /W 1 /H 1 /CS /G /BPC 8 ID \x00 EI Q",
+        b"[ [1] ] TJ",
+        b"[ true null ] TJ",
+        b"[(unterminated)",
+        b"q\x00Q",
+        b"1\x0b2 m",
+        b"1 0 R ",
+        b"1 0 R1 m",
+        b"1 2 R",
+        b"1 2 RG",
+        b"12345678901234567890123 1 Tf",
+        b"123456789012345678901234567890123456789012345678901234567890.5 w",
+    ],
+)
+def test_content_stream__plain_operations_match_byte_wise_reading(data, monkeypatch) -> None:
+    def parse() -> tuple[list[Any], str | None]:
+        content_stream = ContentStream(stream=None, pdf=None)
+        try:
+            content_stream._parse_content_stream(BytesIO(data))
+        except (AssertionError, LimitReachedError, PdfReadError) as exception:
+            return content_stream._operations, repr(exception)
+        return content_stream._operations, None
+
+    result = parse()
+    monkeypatch.setattr(ContentStream, "_read_plain_operations", lambda *_: None)
+    assert result == parse()
+
+
+@pytest.mark.parametrize("data", [b"1 2 Td " * 50, b"[(A) 1 (B)] TJ " * 50, b"/F1 12 Tf [(A)] TJ " * 50])
+def test_content_stream__plain_operations_stop_at_token_limit(data, monkeypatch) -> None:
+    def parse() -> list[Any]:
+        content_stream = ContentStream(stream=None, pdf=None)
+        with (
+            apply_configuration(stream_parsing_work_maximum_count=100),
+            pytest.raises(LimitReachedError, match=r"^Reached maximum number of tokens"),
+        ):
+            content_stream._parse_content_stream(BytesIO(data))
+        return content_stream._operations
+
+    operations = parse()
+    monkeypatch.setattr(ContentStream, "_read_plain_operations", lambda *_: None)
+    assert operations == parse()
+
+
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize("skip_drawing_operations", [False, True])
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"q\n" + b"1 2 m    \n\n  " * 1000 + b"x",
+        b"q 1 0 0 1 2 3 cm\n" + b"1 2 3 4 5 6 c\n" * 1000 + b"BT",
+        b"q " + b"1 0 0 1 0 0 cm " * 1000 + b"(a)",
+        b"1 " * 10_000 + b"(a)",
+        b"+-. " * 10_000,
+        b"q " * 10_000,
+    ],
+)
+def test_content_stream__reading_stays_linear_for_failing_matches(data, skip_drawing_operations) -> None:
+    """A match which fails late must not make the regular expressions backtrack exponentially."""
+    content_stream = ContentStream(stream=None, pdf=None)
+    content_stream._skip_drawing_operations = skip_drawing_operations
+    with contextlib.suppress(PdfReadError):
+        content_stream._parse_content_stream(BytesIO(data))
+
+
+@pytest.mark.parametrize(
+    ("data", "expected_operators"),
+    [
+        (b"1 2 m 3 4 l S 1 0 0 rg 0 g", []),
+        (b"q 1 0 0 1 5 5 cm 1 2 m S Q BT ET", [b"BT", b"ET"]),
+        (b"BT ET q 2 w Q", [b"BT", b"ET"]),
+        # A transformation flushes pending text, so it must not be left out.
+        (b"BT (a) Tj q 1 0 0 1 5 5 cm 1 2 m S Q ET", [b"BT", b"Tj", b"q", b"cm", b"Q", b"ET"]),
+        # A block which contains anything else is not left out either.
+        (b"q /X Do Q", [b"q", b"Do", b"Q"]),
+        (b"q 1 2 m", [b"q"]),
+        # Operands in front of the skipped operators belong to an operation.
+        (b"(a) 1 2 m", [b"m"]),
+    ],
+)
+def test_content_stream__skip_drawing_operations(data, expected_operators) -> None:
+    content_stream = ContentStream(stream=None, pdf=None)
+    content_stream._skip_drawing_operations = True
+    content_stream._parse_content_stream(BytesIO(data))
+    assert [operator for _, operator in content_stream._operations] == expected_operators

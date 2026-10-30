@@ -122,7 +122,7 @@ def crlf_space_check(  # noqa: PLR0913, PLR0917
     memo_tm = memo_cmtm[1]
 
     m_prev = mult(tm_prev, cm_prev)
-    m = mult(tm_matrix, cm_matrix)
+    m = m_prev if tm_matrix == tm_prev and cm_matrix == cm_prev else mult(tm_matrix, cm_matrix)
     orientation = orient(m)
     delta_x = m[4] - m_prev[4]
     delta_y = m[5] - m_prev[5]
@@ -155,7 +155,7 @@ def crlf_space_check(  # noqa: PLR0913, PLR0917
     else:
         lower, upper = line_span[1], line_span[2]
         distance = 0.0 if lower <= axis <= upper else min(abs(axis - lower), abs(axis - upper))
-    last = (output + text)[-1:]
+    last = text[-1:] or output[-1:]
     if distance > 0.8 * min(str_height * scale_prev_y, font_size * scale_y):
         if last not in ("", "\n"):
             output += text + "\n"

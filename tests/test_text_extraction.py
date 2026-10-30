@@ -1639,3 +1639,33 @@ def test_layout_mode_debug_path(tmp_path: Path) -> None:
     assert "font" not in tj_ops[0]
     assert tj_ops[0]["text"] == "Hello"
     assert tj_ops[0]["font_size"] == 12
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"BT /F1 12 Tf 10 10 Td (A) Tj ET q 1 0 0 1 5 5 cm 1 2 m 3 4 l S Q BT 10 30 Td (B) Tj ET",
+        b"BT /F1 12 Tf 10 10 Td (A) Tj q 2 0 0 2 5 5 cm 1 2 m S Q (B) Tj ET",
+        b"BT /F1 12 Tf 10 10 Td (A) Tj ET 50 0 Td q 1 0 0 1 5 5 cm 1 2 m S Q BT (B) Tj ET",
+        b"q 2 0 0 2 0 0 cm 1 2 m S BT /F1 12 Tf 10 10 Td (A) Tj ET Q 1 2 3 rg BT /F1 12 Tf 10 50 Td (B) Tj ET",
+    ],
+)
+def test_extract_text__skipping_drawing_operations_keeps_text(content):
+    writer = PdfWriter()
+    page = writer.add_blank_page(200, 200)
+    font = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+        }
+    )
+    page[NameObject("/Resources")] = DictionaryObject(
+        {NameObject("/Font"): DictionaryObject({NameObject("/F1"): writer._add_object(font)})}
+    )
+    stream = DecodedStreamObject()
+    stream.set_data(content)
+    page[NameObject("/Contents")] = writer._add_object(stream)
+
+    # With a visitor, nothing may be left out.
+    assert page.extract_text() == page.extract_text(visitor_operand_before=lambda *_: None)

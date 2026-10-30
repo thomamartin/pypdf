@@ -86,7 +86,7 @@ from ._image_inline import (
     extract_inline__run_length_decode,
     extract_inline_default,
 )
-from ._utils import StreamParsingBudget, read_hex_string_from_stream, read_string_from_stream
+from ._utils import StreamParsingBudget, create_string_object, read_hex_string_from_stream, read_string_from_stream
 
 if sys.version_info >= (3, 11):
     from typing import Self
@@ -1260,6 +1260,56 @@ class EncodedStreamObject(StreamObject):
 CONTENT_STREAM_ARRAY_MAX_LENGTH = 10_000
 
 
+# One token of the operations which make up nearly all content streams. Anything
+# unusual ends up in the last group, as finditer() would skip it otherwise.
+_CONTENT_WHITESPACE = rb"[\x00\t\n\f\r ]"
+_CONTENT_TOKEN_END = rb"(?=[\t\n\x0b\f\r ()<>\[\]{}/%]|\Z)"
+_CONTENT_NUMBER = rb"[+-]?(?:\d{1,18}(?:\.\d{0,18})?|\.\d{1,18})"
+_CONTENT_OPERANDS = rb"(?:" + _CONTENT_NUMBER + rb"[\t\n\f\r ]+){0,6}"
+_CONTENT_TOKENS = (
+    rb"|(" + _CONTENT_OPERANDS + rb")(?!R[^a-zA-Z])([A-Za-z'\"][!-$&'*-.0-;=?-Z\\^-z|~]{0,31})" + _CONTENT_TOKEN_END
+    + rb"|([+-]?\d{1,18})" + _CONTENT_TOKEN_END
+    + rb"|([+-]?(?:\d{1,18}\.\d{0,18}|\.\d{1,18}))" + _CONTENT_TOKEN_END
+    + rb"|(/[!\"$&'*+,\-.0-9:;=?@A-Z\\^_`a-z|~]*)" + _CONTENT_TOKEN_END
+    + rb"|\(([^()\\]*)\)"
+    rb"|(\()"
+    rb"|<([0-9A-Fa-f]*)>"
+    rb"|(\[)|(\])"
+    rb"|([\s\S]))"
+)
+_CONTENT_TOKEN_PATTERN = re.compile(_CONTENT_WHITESPACE + rb"*(?:((?!))" + _CONTENT_TOKENS)
+# Operators which take only numbers and have no influence on the extracted text,
+# and blocks of them which only change the transformation matrix for themselves.
+# The first character must not be whitespace: as whitespace also follows an
+# operator, there would be many ways to match, which takes exponential time.
+_DRAWING_OPERANDS = rb"(?:[-+.0-9][-+.0-9\t\n\f\r ]{0,127})?"
+_DRAWING_OPERATION = (
+    _DRAWING_OPERANDS
+    + rb"(?:[mlcvyhSsfFBbnkKgGwJjMiW]|re|rg|RG|f\*|B\*|b\*|W\*)" + _CONTENT_TOKEN_END
+    + rb"[\t\n\f\r ]*"
+)
+_DRAWING_BLOCK = (
+    rb"q[\t\n\f\r ]+(?:" + _DRAWING_OPERANDS + rb"cm[\t\n\f\r ]+)*(?:" + _DRAWING_OPERATION + rb")*Q"
+    + _CONTENT_TOKEN_END + rb"[\t\n\f\r ]*"
+)
+_TEXT_TOKEN_PATTERN = re.compile(
+    _CONTENT_WHITESPACE + rb"*(?:((?:" + _DRAWING_OPERATION + rb"|" + _DRAWING_BLOCK + rb")+)" + _CONTENT_TOKENS
+)
+# Operators after which text may wait to be flushed, and the one which flushes it.
+_TEXT_STATE_OPERATORS = frozenset((b"BT", b"ET", b"Tj", b"TJ", b"'", b'"', b"Td", b"TD", b"Tm", b"T*"))
+_CONTENT_SKIPPED = 1
+_CONTENT_OPERANDS_GROUP = 2
+_CONTENT_OPERATOR = 3
+_CONTENT_INTEGER = 4
+_CONTENT_FLOAT = 5
+_CONTENT_NAME = 6
+_CONTENT_STRING = 7
+_CONTENT_ESCAPED_STRING = 8
+_CONTENT_HEX_STRING = 9
+_CONTENT_ARRAY_START = 10
+_CONTENT_ARRAY_END = 11
+
+
 class ContentStream(DecodedStreamObject):
     """
     In order to be fast, this data structure can contain either:
@@ -1281,6 +1331,9 @@ class ContentStream(DecodedStreamObject):
     * when .operations is set, ._data is set to None.
     """
     _OPERATOR_LENGTH_LIMIT = 128
+    # Leaves out operators without an influence on text extraction.
+    _skip_drawing_operations = False
+    _text_pending = False
 
     def __init__(
         self,
@@ -1457,6 +1510,8 @@ class ContentStream(DecodedStreamObject):
         operands: list[int | str | PdfObject] = []
         parsing_budget = StreamParsingBudget(remaining_budget=get_configuration().stream_parsing_work_maximum_count)
         while True:
+            if not operands and isinstance(stream, BytesIO):
+                self._read_plain_operations(stream, parsing_budget)
             peek = read_non_whitespace(stream)
             if peek in (b"", 0):
                 break
@@ -1475,6 +1530,8 @@ class ContentStream(DecodedStreamObject):
                 else:
                     self._check_limits(parsing_budget=parsing_budget, token_decrement=1)
                     self._operations.append((operands, operator))
+                    if operator in _TEXT_STATE_OPERATORS:
+                        self._text_pending = operator != b"ET"
                     operands = []
             elif peek == b"%":
                 # If we encounter a comment in the content stream, we have to
@@ -1487,6 +1544,101 @@ class ContentStream(DecodedStreamObject):
             else:
                 self._check_limits(parsing_budget=parsing_budget, token_decrement=1)
                 operands.append(read_object(stream, None, self.forced_encoding, parsing_budget=parsing_budget))
+
+    def _read_plain_operations(self, stream: StreamType, parsing_budget: StreamParsingBudget) -> None:
+        """
+        Read operations with a regular expression instead of byte by byte.
+
+        This stops in front of the first operation with anything unusual, for
+        example an inline image, a dictionary or a comment. The caller has all
+        the handling for these.
+
+        Args:
+            stream: The stream to read from, at the start of an operation.
+            parsing_budget: The allowed parsing budget.
+
+        """
+        data = cast(BytesIO, stream).getvalue()
+        forced_encoding = self.forced_encoding
+        append_operation = self._operations.append
+        pattern = _TEXT_TOKEN_PATTERN if self._skip_drawing_operations else _CONTENT_TOKEN_PATTERN
+        text_pending = self._text_pending
+        budget = parsing_budget.remaining_budget
+        end_of_operation = stream.tell()
+        tokens = pattern.finditer(data, end_of_operation)
+        spent = 0
+        array_elements = 0
+        operands: list[Any] = []
+        array: ArrayObject | None = None
+        while (token := next(tokens, None)) is not None:
+            kind = token.lastindex
+            value: Any
+            if kind == _CONTENT_SKIPPED:
+                if operands or array is not None or (text_pending and b"q" in token[kind]):
+                    break
+                end_of_operation = token.end()
+                continue
+            if kind == _CONTENT_OPERATOR:
+                operator = token[kind]
+                if array is not None or operator == b"BI":
+                    break
+                operands.extend(
+                    [
+                        float.__new__(FloatObject, float(number))
+                        if b"." in number
+                        else int.__new__(NumberObject, int(number))
+                        for number in token[_CONTENT_OPERANDS_GROUP].split()
+                    ]
+                )
+                spent += len(operands) + array_elements + 1
+                if spent > budget:
+                    # The caller reports this at the token where it happens.
+                    spent -= len(operands) + array_elements + 1
+                    break
+                append_operation((operands, operator))
+                if operator in _TEXT_STATE_OPERATORS:
+                    text_pending = operator != b"ET"
+                array_elements = 0
+                operands = []
+                end_of_operation = token.end()
+                continue
+            if kind == _CONTENT_INTEGER:
+                value = int.__new__(NumberObject, int(token[kind]))
+            elif kind == _CONTENT_FLOAT:
+                value = float.__new__(FloatObject, float(token[kind]))
+            elif kind == _CONTENT_NAME:
+                value = NameObject(token[kind].decode("ascii"))
+            elif kind == _CONTENT_STRING:
+                value = create_string_object(token[kind], forced_encoding)
+            elif kind == _CONTENT_ESCAPED_STRING:
+                stream.seek(token.start(kind))
+                value = read_string_from_stream(stream, forced_encoding)
+                tokens = pattern.finditer(data, stream.tell())
+            elif kind == _CONTENT_HEX_STRING:
+                digits = token[kind]
+                if len(digits) % 2:
+                    digits += b"0"
+                value = create_string_object(bytes.fromhex(digits.decode("ascii")), forced_encoding)
+            elif kind == _CONTENT_ARRAY_START:
+                if array is not None:
+                    break
+                array = ArrayObject()
+                continue
+            elif kind == _CONTENT_ARRAY_END:
+                if array is None or len(array) > get_configuration().array_maximum_element_count:
+                    break
+                value = array
+                array_elements += len(array)
+                array = None
+            else:
+                break
+            if array is None:
+                operands.append(value)
+            else:
+                array.append(value)
+        parsing_budget.remaining_budget -= spent
+        self._text_pending = text_pending
+        stream.seek(end_of_operation)
 
     def _read_inline_image(self, stream: StreamType, parsing_budget: StreamParsingBudget) -> dict[str, Any]:
         # begin reading just after the "BI" - begin image

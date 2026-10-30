@@ -1637,6 +1637,26 @@ class ContentStream(DecodedStreamObject):
         self._operations = operations
         self._data = b""
 
+    def _prepend_operations(self, operations: list[tuple[Any, bytes]]) -> None:
+        """
+        Add operations at the beginning of the stream without parsing it.
+
+        Args:
+            operations: The operations to add, in their final order.
+
+        """
+        if self._operations or not self._data:
+            self._operations[:0] = operations
+            return
+        prefix = BytesIO()
+        for operands, operator in operations:
+            for operand in operands:
+                operand.write_to_stream(prefix)
+                prefix.write(b" ")
+            prefix.write(operator)
+            prefix.write(b"\n")
+        self._data = prefix.getvalue() + self._data
+
     def isolate_graphics_state(self) -> None:
         if self._operations:
             self._operations.insert(0, ([], b"q"))

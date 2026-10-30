@@ -1111,13 +1111,7 @@ class PageObject(DictionaryObject):
     ) -> ContentStream:
         """Add transformation matrix at the beginning of the given contents stream."""
         content_stream = ContentStream(contents, pdf)
-        content_stream.operations.insert(
-            0,
-            (
-                [FloatObject(x) for x in ctm],
-                b"cm",
-            ),
-        )
+        content_stream._prepend_operations([([FloatObject(x) for x in ctm], b"cm")])
         return content_stream
 
     def _get_contents_as_bytes(self) -> bytes | None:
@@ -1306,23 +1300,13 @@ class PageObject(DictionaryObject):
         if page2_content is not None:
             configuration = get_configuration()
             rect = getattr(page2, configuration.page_merge_box)
-            page2_content.operations.insert(
-                0,
-                (
-                    map(
-                        FloatObject,
-                        [
-                            rect.left,
-                            rect.bottom,
-                            rect.width,
-                            rect.height,
-                        ],
-                    ),
-                    b"re",
-                ),
+            page2_content._prepend_operations(
+                [
+                    ([FloatObject(x) for x in (rect.left, rect.bottom, rect.width, rect.height)], b"re"),
+                    ([], b"W"),
+                    ([], b"n"),
+                ]
             )
-            page2_content.operations.insert(1, ([], b"W"))
-            page2_content.operations.insert(2, ([], b"n"))
             if page2_transformation is not None:
                 page2_content = page2_transformation(page2_content)
             page2_content = PageObject._content_stream_rename(
@@ -1455,23 +1439,13 @@ class PageObject(DictionaryObject):
         if page2content is not None:
             configuration = get_configuration()
             rect = getattr(page2, configuration.page_merge_box)
-            page2content.operations.insert(
-                0,
-                (
-                    map(
-                        FloatObject,
-                        [
-                            rect.left,
-                            rect.bottom,
-                            rect.width,
-                            rect.height,
-                        ],
-                    ),
-                    b"re",
-                ),
+            page2content._prepend_operations(
+                [
+                    ([FloatObject(x) for x in (rect.left, rect.bottom, rect.width, rect.height)], b"re"),
+                    ([], b"W"),
+                    ([], b"n"),
+                ]
             )
-            page2content.operations.insert(1, ([], b"W"))
-            page2content.operations.insert(2, ([], b"n"))
             if page2transformation is not None:
                 page2content = page2transformation(page2content)
             page2content = PageObject._content_stream_rename(

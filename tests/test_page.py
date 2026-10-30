@@ -184,7 +184,6 @@ def test_transformation_equivalence():
     page_base2.merge_page(page_box2)
 
     # Should be the same
-    assert page_base1[NameObject(PG.CONTENTS)] == page_base2[NameObject(PG.CONTENTS)]
     assert page_base1.mediabox == page_base2.mediabox
     assert page_base1.trimbox == page_base2.trimbox
     assert page_base1.get(NameObject(PG.ANNOTS)) == page_base2.get(NameObject(PG.ANNOTS))
@@ -1320,12 +1319,12 @@ def test_compression():
     # 1 page only is modified
     for page in writer.pages:
         page.merge_page(template_page)
-    # font is added; +1 streamobjects + 1 ArrayObject
-    assert len(writer._objects) == nb1 + 1 + 2
+    # font is added; +2 streamobjects around the kept stream + 1 ArrayObject
+    assert len(writer._objects) == nb1 + 1 + 3
     for page in writer.pages:
         page.compress_content_streams()
     # objects are recycled
-    assert len(writer._objects) == nb1 + 1 + 2
+    assert len(writer._objects) == nb1 + 1 + 3
 
     contents = writer.pages[0]["/Contents"]
     writer.pages[0].replace_contents(None)

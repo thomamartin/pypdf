@@ -73,6 +73,7 @@ from .errors import PageSizeNotDefinedError, PdfReadError
 from .generic import (
     ArrayObject,
     ContentStream,
+    DecodedStreamObject,
     DictionaryObject,
     EncodedStreamObject,
     FloatObject,
@@ -1453,11 +1454,11 @@ class PageObject(DictionaryObject):
                 except AttributeError:
                     pass
 
-        new_content_array = ArrayObject()
-        original_content = self.get_contents()
-        if original_content is not None:
-            original_content.isolate_graphics_state()
-            new_content_array.append(original_content)
+        # The existing streams stay untouched: decoding them only to join them
+        # with the merged content is slow and loses their compression.
+        original_streams = self._get_content_stream_references(pdf)
+        before = b"q\n" if original_streams else b""
+        after = b"\nQ\n" if original_streams else b""
 
         page2content = page2.get_contents()
         if page2content is not None:
@@ -1477,15 +1478,52 @@ class PageObject(DictionaryObject):
             )
             page2content.isolate_graphics_state()
             if over:
-                new_content_array.append(page2content)
+                after += page2content.get_data()
             else:
-                new_content_array.insert(0, page2content)
+                before = page2content.get_data() + before
 
         # if expanding the page to fit a new page, calculate the new media box size
         if expand:
             self._expand_mediabox(page2, ctm)
 
-        self.replace_contents(new_content_array)
+        new_contents = ArrayObject()
+        if before:
+            new_contents.append(pdf._add_object(self._create_content_stream(before)))
+        new_contents.extend(original_streams)
+        if after:
+            new_contents.append(pdf._add_object(self._create_content_stream(after)))
+        self[NameObject(PG.CONTENTS)] = pdf._add_object(new_contents)
+        # forces recalculation of images
+        self._content_stream_images = None
+
+    @staticmethod
+    def _create_content_stream(data: bytes) -> StreamObject:
+        stream = DecodedStreamObject()
+        stream.set_data(data)
+        return stream.flate_encode()
+
+    def _get_content_stream_references(self, pdf: Any) -> list[IndirectObject]:
+        """
+        Get references to all content streams of a page attached to a writer.
+
+        Args:
+            pdf: The writer of this page.
+
+        Returns:
+            The references in content order, without invalid entries.
+
+        """
+        if PG.CONTENTS not in self:
+            return []
+        contents = self.raw_get(PG.CONTENTS)
+        resolved = contents.get_object()
+        entries = list(resolved) if isinstance(resolved, ArrayObject) else [contents]
+        references = []
+        for entry in entries:
+            if not isinstance(entry.get_object(), StreamObject):
+                continue
+            references.append(entry if isinstance(entry, IndirectObject) else pdf._add_object(entry))
+        return references
 
     def _expand_mediabox(
         self, page2: "PageObject", ctm: CompressedTransformationMatrix | None

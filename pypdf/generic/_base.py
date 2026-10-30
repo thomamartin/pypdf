@@ -32,7 +32,6 @@ import re
 import sys
 from collections.abc import Callable, Sequence
 from math import log10
-from struct import iter_unpack
 from typing import Any, ClassVar, Optional, TypeGuard, Union, cast
 
 if sys.version_info >= (3, 11):
@@ -472,6 +471,9 @@ class IndirectObject(PdfObject):
 FLOAT_WRITE_PRECISION = 8  # shall be min 5 digits max, allow user adj
 
 
+_UNSAFE_STRING_BYTE = re.compile(rb"[^0-9A-Za-z ]")
+
+
 class FloatObject(float, PdfObject):
     def __new__(
         cls, value: Any = "0.0", context: Any | None = None
@@ -755,19 +757,8 @@ class TextStringObject(str, PdfObject):  # noqa: SLOT000
         return bytearr
 
     def write_to_stream(self, stream: StreamType) -> None:
-        bytearr = self.get_encoded_bytes()
-        stream.write(b"(")
-        for c_ in iter_unpack("c", bytearr):
-            c = cast(bytes, c_[0])
-            if not c.isalnum() and c != b" ":
-                # This:
-                #   stream.write(rf"\{c:0>3o}".encode())
-                # gives
-                #   https://github.com/davidhalter/parso/issues/207
-                stream.write(b"\\%03o" % ord(c))
-            else:
-                stream.write(c)
-        stream.write(b")")
+        escaped = _UNSAFE_STRING_BYTE.sub(lambda match: b"\\%03o" % match[0][0], self.get_encoded_bytes())
+        stream.write(b"(" + escaped + b")")
 
 
 class NameObject(str, PdfObject):  # noqa: SLOT000

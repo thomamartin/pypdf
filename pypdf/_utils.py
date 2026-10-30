@@ -248,6 +248,7 @@ NEUTRAL_CHARACTER_RANGES = (
 )
 
 
+@functools.lru_cache(maxsize=4096)
 def is_char_neutral(char: str, custom_special_characters: str = "") -> bool:
     """Check if a character is part of neutral character ranges"""
     if any(start <= char <= end for start, end in NEUTRAL_CHARACTER_RANGES):
@@ -263,6 +264,7 @@ RTL_CHARACTER_RANGES = (
 )
 
 
+@functools.lru_cache(maxsize=4096)
 def is_char_rtl(char: str, custom_rtl_min: str = "", custom_rtl_max: str = "") -> bool:
     """Check if a character is part of RTL character ranges"""
     if any(start <= char <= end for start, end in RTL_CHARACTER_RANGES):

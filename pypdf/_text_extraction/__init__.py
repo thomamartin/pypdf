@@ -122,7 +122,7 @@ def crlf_space_check(  # noqa: PLR0913, PLR0917
     memo_tm = memo_cmtm[1]
 
     m_prev = mult(tm_prev, cm_prev)
-    m = mult(tm_matrix, cm_matrix)
+    m = m_prev if tm_matrix == tm_prev and cm_matrix == cm_prev else mult(tm_matrix, cm_matrix)
     orientation = orient(m)
     delta_x = m[4] - m_prev[4]
     delta_y = m[5] - m_prev[5]

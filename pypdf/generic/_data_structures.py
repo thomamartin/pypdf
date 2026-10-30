@@ -86,7 +86,7 @@ from ._image_inline import (
     extract_inline__run_length_decode,
     extract_inline_default,
 )
-from ._utils import StreamParsingBudget, read_hex_string_from_stream, read_string_from_stream
+from ._utils import StreamParsingBudget, create_string_object, read_hex_string_from_stream, read_string_from_stream
 
 if sys.version_info >= (3, 11):
     from typing import Self
@@ -101,6 +101,7 @@ IndirectPattern = re.compile(rb"[+-]?(\d+)\s+(\d+)\s+R[^a-zA-Z]")
 # Large arrays consist mostly of them, for example in the /ParentTree of the
 # structure tree, so the clone loops check the exact type first and skip the
 # slower isinstance() checks.
+_CHAIN_FIELDS = frozenset(("/Next", "/Prev", "/N", "/V"))
 _SCALAR_TYPES = frozenset(
     (BooleanObject, ByteStringObject, FloatObject, NameObject, NullObject, NumberObject, TextStringObject)
 )
@@ -143,7 +144,12 @@ class ArrayObject(list[Any], PdfObject):
         for data in self:
             if type(data) in _SCALAR_TYPES:
                 # Same as the generic case below, but without the isinstance() checks.
-                arr.append(data.clone(pdf_dest, force_duplicate, ignore_fields))
+                # Direct scalars are immutable and can be shared with the source.
+                arr.append(
+                    data.clone(pdf_dest, force_duplicate, ignore_fields)
+                    if hasattr(data, "indirect_reference")
+                    else data
+                )
             elif isinstance(data, StreamObject):
                 dup = data._reference_clone(
                     data.clone(pdf_dest, force_duplicate, ignore_fields),
@@ -375,7 +381,7 @@ class DictionaryObject(dict[Any, Any], PdfObject):
                 ignore_fields[x] -= 1  # type: ignore[operator]
             x += 1
         #  Check if this is a chain list, we need to loop to prevent recur
-        if any(
+        if not _CHAIN_FIELDS.isdisjoint(src) and any(
             field not in ignore_fields
             and field in src
             and isinstance(src.raw_get(field), IndirectObject)
@@ -455,6 +461,10 @@ class DictionaryObject(dict[Any, Any], PdfObject):
                     assert vv.indirect_reference is not None
                     self[k.clone(pdf_dest)] = vv.indirect_reference
                 elif k not in self:
+                    if type(v) in _SCALAR_TYPES and not hasattr(v, "indirect_reference"):
+                        # Direct scalars are immutable and can be shared with the source.
+                        dict.__setitem__(self, NameObject(k), v)
+                        continue
                     self[NameObject(k)] = (
                         v.clone(pdf_dest, force_duplicate, ignore_fields)
                         if hasattr(v, "clone")
@@ -1627,6 +1637,26 @@ class ContentStream(DecodedStreamObject):
         self._operations = operations
         self._data = b""
 
+    def _prepend_operations(self, operations: list[tuple[Any, bytes]]) -> None:
+        """
+        Add operations at the beginning of the stream without parsing it.
+
+        Args:
+            operations: The operations to add, in their final order.
+
+        """
+        if self._operations or not self._data:
+            self._operations[:0] = operations
+            return
+        prefix = BytesIO()
+        for operands, operator in operations:
+            for operand in operands:
+                operand.write_to_stream(prefix)
+                prefix.write(b" ")
+            prefix.write(operator)
+            prefix.write(b"\n")
+        self._data = prefix.getvalue() + self._data
+
     def isolate_graphics_state(self) -> None:
         if self._operations:
             self._operations.insert(0, ([], b"q"))
@@ -1721,6 +1751,168 @@ def read_object(  # noqa: PLR0911
     raise PdfReadError(
         f"Invalid Elementary Object starting with {tok!r} @{pos}: {stream_extract!r}"
     )
+
+
+# One token of the objects which make up nearly all of a typical document. A
+# name with escapes or other bytes outside of the plain set, a sign in front of
+# a reference and anything else which is unusual does not match on purpose.
+_TOKEN_END = rb"(?=[\x00\t\n\f\r ()<>\[\]{}/%]|\Z)"
+_TOKEN_PATTERN = re.compile(
+    rb"[\x00\t\n\f\r ]*(?:"
+    rb"(/[!\"$&'*+,\-.0-9:;=?@A-Z\\^_`a-z|~]*)" + _TOKEN_END
+    + rb"|(\d{1,10})[\x00\t\n\f\r ]+(\d{1,5})[\x00\t\n\f\r ]+R(?![a-zA-Z])"
+    rb"|([+-]?\d{1,18})" + _TOKEN_END
+    + rb"|([+-]?(?:\d{1,18}\.\d{0,18}|\.\d{1,18}))" + _TOKEN_END
+    + rb"|(<<)|(>>)|(\[)|(\])"
+    rb"|\(([^()\\]*)\)"
+    rb"|([(<])"
+    rb"|(true|false|null)" + _TOKEN_END
+    + rb"|([\s\S]))"  # Keeps finditer() from skipping what is not a token
+)
+_TOKEN_NAME = 1
+_TOKEN_REFERENCE = 3  # The last group of the reference
+_TOKEN_INTEGER = 4
+_TOKEN_FLOAT = 5
+_TOKEN_DICTIONARY_START = 6
+_TOKEN_DICTIONARY_END = 7
+_TOKEN_ARRAY_START = 8
+_TOKEN_ARRAY_END = 9
+_TOKEN_PLAIN_STRING = 10
+_TOKEN_STRING = 11
+_TOKEN_LITERAL = 12
+_MAXIMUM_FAST_NESTING = 64
+
+
+def _read_object_from_tokens(
+    stream: StreamType,
+    data: bytes,
+    start: int,
+    pdf: PdfReaderProtocol,
+    maximum_tokens: int,
+) -> tuple[PdfObject, int] | None:
+    """
+    Read a well-formed object with a regular expression instead of byte by byte.
+
+    Anything unusual is left to :func:`read_object` by returning ``None``, which
+    has all the handling for malformed input and for its warnings.
+
+    Args:
+        stream: The stream, which is only used to read uncommon strings.
+        data: The whole content of the stream.
+        start: The position of the object in ``data``.
+        pdf: The corresponding PDF file.
+        maximum_tokens: The number of tokens after which to give up.
+
+    Returns:
+        The object and the position after it, or ``None``.
+
+    """
+    tokens = _TOKEN_PATTERN.finditer(data, start)
+    position = start
+    set_item = dict.__setitem__
+    enclosing: list[tuple[Any, Any, bool]] = []
+    container: Any = None
+    in_dictionary = False
+    key: Any = None
+    value: Any
+    for _ in range(maximum_tokens):
+        token = next(tokens, None)
+        if token is None:
+            return None
+        kind = token.lastindex
+        if kind == _TOKEN_NAME:
+            value = NameObject(token[1].decode("ascii"))
+            if in_dictionary and key is None:
+                key = value
+                continue
+        elif in_dictionary and key is None and kind != _TOKEN_DICTIONARY_END:
+            return None
+        elif kind == _TOKEN_INTEGER:
+            value = int.__new__(NumberObject, int(token[4]))
+        elif kind == _TOKEN_REFERENCE:
+            value = IndirectObject(int(token[2]), int(token[3]), pdf)
+        elif kind == _TOKEN_FLOAT:
+            value = float.__new__(FloatObject, float(token[5]))
+        elif kind in (_TOKEN_DICTIONARY_START, _TOKEN_ARRAY_START):
+            if len(enclosing) >= _MAXIMUM_FAST_NESTING:
+                return None
+            enclosing.append((container, key, in_dictionary))
+            in_dictionary = kind == _TOKEN_DICTIONARY_START
+            container = DictionaryObject() if in_dictionary else ArrayObject()
+            key = None
+            continue
+        elif kind in (_TOKEN_DICTIONARY_END, _TOKEN_ARRAY_END):
+            if container is None or in_dictionary != (kind == _TOKEN_DICTIONARY_END) or key is not None:
+                return None
+            value = container
+            container, key, in_dictionary = enclosing.pop()
+        elif kind == _TOKEN_PLAIN_STRING:
+            value = create_string_object(token[10])
+        elif kind == _TOKEN_STRING:
+            stream.seek(token.start(_TOKEN_STRING))
+            try:
+                value = read_object(stream, pdf)
+            except MemoryError:  # pragma: no cover
+                raise
+            except Exception:
+                return None
+            position = stream.tell()
+            tokens = _TOKEN_PATTERN.finditer(data, position)
+        elif kind == _TOKEN_LITERAL:
+            literal = token[12]
+            value = NullObject() if literal == b"null" else BooleanObject(literal == b"true")
+        else:
+            return None
+
+        if container is None:
+            return value, position if kind == _TOKEN_STRING else token.end()
+        if key is None:
+            container.append(value)
+        elif key in container:
+            return None
+        else:
+            set_item(container, key, value)
+            key = None
+    return None
+
+
+def read_indirect_object(stream: StreamType, pdf: PdfReaderProtocol) -> PdfObject:
+    """
+    Read the object at the current position, which is at the top level of a document.
+
+    Args:
+        stream: The stream to read from.
+        pdf: The corresponding PDF file.
+
+    Returns:
+        The parsed object.
+
+    """
+    if not isinstance(stream, BytesIO):
+        return read_object(stream, pdf)
+    configuration = get_configuration()
+    start = stream.tell()
+    result = _read_object_from_tokens(
+        stream,
+        stream.getvalue(),
+        start,
+        pdf,
+        min(
+            configuration.array_maximum_element_count or sys.maxsize,
+            configuration.dictionary_maximum_element_count or sys.maxsize,
+        ),
+    )
+    if result is None:
+        stream.seek(start)
+        return read_object(stream, pdf)
+    value, position = result
+    stream.seek(position)
+    if type(value) is DictionaryObject:
+        data = dict(value)
+        DictionaryObject._read_stream_data(stream=stream, pdf=pdf, data=data)
+        if "__streamdata__" in data:
+            return StreamObject.initialize_from_dictionary(data)
+    return value
 
 
 class Field(TreeObject):

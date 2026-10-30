@@ -1292,14 +1292,16 @@ def _clone_and_count(container: ArrayObject | DictionaryObject, writer: PdfWrite
 @pytest.mark.parametrize(
     ("as_array", "calls_per_1000_elements"),
     [
-        # 7,600 to 9,600 before the fix, depending on the Python version, and
-        # 3,600 before the shortcut for nulls in NullObject.clone().
-        pytest.param(True, 3200, id="array"),
+        # 7,600 to 9,600 before the fix, depending on the Python version,
+        # 3,600 before the shortcut for nulls in NullObject.clone(), and 3,200
+        # while direct scalars were copied instead of shared with the source.
+        pytest.param(True, 0, id="array"),
         # 10,600 to 11,600 before the fix, depending on the Python version,
         # 8,600 while PdfObject inherited from a Protocol, as the isinstance()
-        # checks in DictionaryObject.__setitem__() ran Python code, and 4,600
-        # before the shortcut for nulls in NullObject.clone().
-        pytest.param(False, 4200, id="dictionary"),
+        # checks in DictionaryObject.__setitem__() ran Python code, 4,600
+        # before the shortcut for nulls in NullObject.clone(), and 4,200 while
+        # direct scalars were copied instead of shared with the source.
+        pytest.param(False, 0, id="dictionary"),
     ],
 )
 def test_cloning_direct_objects__function_calls_and_exceptions(as_array, calls_per_1000_elements):

@@ -53,6 +53,7 @@ from ._data_structures import (
     Field,
     StreamObject,
     TreeObject,
+    read_indirect_object,
     read_object,
 )
 from ._files import EmbeddedFile
@@ -112,6 +113,7 @@ __all__ = [
     "is_null_or_none",
     "read_hex_string_from_stream",
     # Data structures core functions
+    "read_indirect_object",
     "read_object",
     "read_string_from_stream",
 ]

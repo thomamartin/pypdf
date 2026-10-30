@@ -26,12 +26,12 @@
 # POSSIBILITY OF SUCH DAMAGE.
 import binascii
 import codecs
+import functools
 import hashlib
 import re
 import sys
 from collections.abc import Callable, Sequence
 from math import log10
-from struct import iter_unpack
 from typing import Any, ClassVar, Optional, TypeGuard, Union, cast
 
 if sys.version_info >= (3, 11):
@@ -471,6 +471,10 @@ class IndirectObject(PdfObject):
 FLOAT_WRITE_PRECISION = 8  # shall be min 5 digits max, allow user adj
 
 
+_PDFDOC_CHARACTERS = frozenset(_pdfdoc_encoding_rev)
+_UNSAFE_STRING_BYTE = re.compile(rb"[^0-9A-Za-z ]")
+
+
 class FloatObject(float, PdfObject):
     def __new__(
         cls, value: Any = "0.0", context: Any | None = None
@@ -671,13 +675,11 @@ class TextStringObject(str, PdfObject):  # noqa: SLOT000
             text_string_object._original_bytes = original_bytes
             text_string_object.autodetect_utf16 = True
             text_string_object.utf16_bom = original_bytes[:2]
+        elif _PDFDOC_CHARACTERS.issuperset(text_string_object):
+            text_string_object.autodetect_pdfdocencoding = True
         else:
-            try:
-                encode_pdfdocencoding(text_string_object)
-                text_string_object.autodetect_pdfdocencoding = True
-            except UnicodeEncodeError:
-                text_string_object.autodetect_utf16 = True
-                text_string_object.utf16_bom = codecs.BOM_UTF16_BE
+            text_string_object.autodetect_utf16 = True
+            text_string_object.utf16_bom = codecs.BOM_UTF16_BE
         return text_string_object
 
     def clone(
@@ -754,23 +756,12 @@ class TextStringObject(str, PdfObject):  # noqa: SLOT000
         return bytearr
 
     def write_to_stream(self, stream: StreamType) -> None:
-        bytearr = self.get_encoded_bytes()
-        stream.write(b"(")
-        for c_ in iter_unpack("c", bytearr):
-            c = cast(bytes, c_[0])
-            if not c.isalnum() and c != b" ":
-                # This:
-                #   stream.write(rf"\{c:0>3o}".encode())
-                # gives
-                #   https://github.com/davidhalter/parso/issues/207
-                stream.write(b"\\%03o" % ord(c))
-            else:
-                stream.write(c)
-        stream.write(b")")
+        escaped = _UNSAFE_STRING_BYTE.sub(lambda match: b"\\%03o" % match[0][0], self.get_encoded_bytes())
+        stream.write(b"(" + escaped + b")")
 
 
 class NameObject(str, PdfObject):  # noqa: SLOT000
-    delimiter_pattern = re.compile(rb"\s+|[\(\)<>\[\]{}/%]")
+    delimiter_pattern = re.compile(rb"[\s\x00]+|[\(\)<>\[\]{}/%]")
     prefix = b"/"
     renumber_table: ClassVar[dict[str, bytes]] = {
         **{chr(i): f"#{i:02X}".encode() for i in b"#()<>[]{}/%"},
@@ -803,6 +794,8 @@ class NameObject(str, PdfObject):  # noqa: SLOT000
     def write_to_stream(self, stream: StreamType) -> None:
         stream.write(self.renumber())
 
+    # Documents use few distinct names very often, and names are small.
+    @functools.lru_cache(maxsize=4096)  # noqa: B019
     def renumber(self) -> bytes:
         out = self[0].encode("utf-8")
         if out != b"/":

@@ -27,6 +27,7 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
+import functools
 import math
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from copy import deepcopy
@@ -72,6 +73,7 @@ from .errors import PageSizeNotDefinedError, PdfReadError
 from .generic import (
     ArrayObject,
     ContentStream,
+    DecodedStreamObject,
     DictionaryObject,
     EncodedStreamObject,
     FloatObject,
@@ -550,6 +552,39 @@ class VirtualListImages(Sequence[ImageFile]):
     def __str__(self) -> str:
         p = [f"Image_{i}={n}" for i, n in enumerate(self.ids_function())]
         return f"[{', '.join(p)}]"
+
+
+@functools.lru_cache(maxsize=16)
+def _rename_resources(data: bytes, rename: tuple[tuple[Any, Any], ...]) -> bytes:
+    """
+    Rename resources in a content stream.
+
+    Merging a stamp onto many pages often needs the same names to be replaced,
+    so this avoids parsing the same stream for each page.
+
+    Args:
+        data: The content stream.
+        rename: The pairs of the old and the new name.
+
+    Returns:
+        The updated content stream.
+
+    """
+    renamed = dict(rename)
+    stream = ContentStream(None, None)
+    stream.set_data(data)
+    for operands, _operator in stream.operations:
+        if isinstance(operands, list):
+            for i, op in enumerate(operands):
+                if isinstance(op, NameObject):
+                    operands[i] = renamed.get(op, op)
+        elif isinstance(operands, dict):
+            for i, op in operands.items():
+                if isinstance(op, NameObject):
+                    operands[i] = renamed.get(op, op)
+        else:
+            raise KeyError(f"Type of operands is {type(operands)}")
+    return stream.get_data()
 
 
 class PageObject(DictionaryObject):
@@ -1090,17 +1125,7 @@ class PageObject(DictionaryObject):
         if not rename:
             return stream
         stream = ContentStream(stream, pdf)
-        for operands, _operator in stream.operations:
-            if isinstance(operands, list):
-                for i, op in enumerate(operands):
-                    if isinstance(op, NameObject):
-                        operands[i] = rename.get(op, op)
-            elif isinstance(operands, dict):
-                for i, op in operands.items():
-                    if isinstance(op, NameObject):
-                        operands[i] = rename.get(op, op)
-            else:
-                raise KeyError(f"Type of operands is {type(operands)}")
+        stream.set_data(_rename_resources(stream.get_data(), tuple(rename.items())))
         return stream
 
     @staticmethod
@@ -1111,13 +1136,7 @@ class PageObject(DictionaryObject):
     ) -> ContentStream:
         """Add transformation matrix at the beginning of the given contents stream."""
         content_stream = ContentStream(contents, pdf)
-        content_stream.operations.insert(
-            0,
-            (
-                [FloatObject(x) for x in ctm],
-                b"cm",
-            ),
-        )
+        content_stream._prepend_operations([([FloatObject(x) for x in ctm], b"cm")])
         return content_stream
 
     def _get_contents_as_bytes(self) -> bytes | None:
@@ -1306,23 +1325,13 @@ class PageObject(DictionaryObject):
         if page2_content is not None:
             configuration = get_configuration()
             rect = getattr(page2, configuration.page_merge_box)
-            page2_content.operations.insert(
-                0,
-                (
-                    map(
-                        FloatObject,
-                        [
-                            rect.left,
-                            rect.bottom,
-                            rect.width,
-                            rect.height,
-                        ],
-                    ),
-                    b"re",
-                ),
+            page2_content._prepend_operations(
+                [
+                    ([FloatObject(x) for x in (rect.left, rect.bottom, rect.width, rect.height)], b"re"),
+                    ([], b"W"),
+                    ([], b"n"),
+                ]
             )
-            page2_content.operations.insert(1, ([], b"W"))
-            page2_content.operations.insert(2, ([], b"n"))
             if page2_transformation is not None:
                 page2_content = page2_transformation(page2_content)
             page2_content = PageObject._content_stream_rename(
@@ -1445,33 +1454,23 @@ class PageObject(DictionaryObject):
                 except AttributeError:
                     pass
 
-        new_content_array = ArrayObject()
-        original_content = self.get_contents()
-        if original_content is not None:
-            original_content.isolate_graphics_state()
-            new_content_array.append(original_content)
+        # The existing streams stay untouched: decoding them only to join them
+        # with the merged content is slow and loses their compression.
+        original_streams = self._get_content_stream_references(pdf)
+        before = b"q\n" if original_streams else b""
+        after = b"\nQ\n" if original_streams else b""
 
         page2content = page2.get_contents()
         if page2content is not None:
             configuration = get_configuration()
             rect = getattr(page2, configuration.page_merge_box)
-            page2content.operations.insert(
-                0,
-                (
-                    map(
-                        FloatObject,
-                        [
-                            rect.left,
-                            rect.bottom,
-                            rect.width,
-                            rect.height,
-                        ],
-                    ),
-                    b"re",
-                ),
+            page2content._prepend_operations(
+                [
+                    ([FloatObject(x) for x in (rect.left, rect.bottom, rect.width, rect.height)], b"re"),
+                    ([], b"W"),
+                    ([], b"n"),
+                ]
             )
-            page2content.operations.insert(1, ([], b"W"))
-            page2content.operations.insert(2, ([], b"n"))
             if page2transformation is not None:
                 page2content = page2transformation(page2content)
             page2content = PageObject._content_stream_rename(
@@ -1479,15 +1478,52 @@ class PageObject(DictionaryObject):
             )
             page2content.isolate_graphics_state()
             if over:
-                new_content_array.append(page2content)
+                after += page2content.get_data()
             else:
-                new_content_array.insert(0, page2content)
+                before = page2content.get_data() + before
 
         # if expanding the page to fit a new page, calculate the new media box size
         if expand:
             self._expand_mediabox(page2, ctm)
 
-        self.replace_contents(new_content_array)
+        new_contents = ArrayObject()
+        if before:
+            new_contents.append(pdf._add_object(self._create_content_stream(before)))
+        new_contents.extend(original_streams)
+        if after:
+            new_contents.append(pdf._add_object(self._create_content_stream(after)))
+        self[NameObject(PG.CONTENTS)] = pdf._add_object(new_contents)
+        # forces recalculation of images
+        self._content_stream_images = None
+
+    @staticmethod
+    def _create_content_stream(data: bytes) -> StreamObject:
+        stream = DecodedStreamObject()
+        stream.set_data(data)
+        return stream.flate_encode()
+
+    def _get_content_stream_references(self, pdf: Any) -> list[IndirectObject]:
+        """
+        Get references to all content streams of a page attached to a writer.
+
+        Args:
+            pdf: The writer of this page.
+
+        Returns:
+            The references in content order, without invalid entries.
+
+        """
+        if PG.CONTENTS not in self:
+            return []
+        contents = self.raw_get(PG.CONTENTS)
+        resolved = contents.get_object()
+        entries = list(resolved) if isinstance(resolved, ArrayObject) else [contents]
+        references = []
+        for entry in entries:
+            if not isinstance(entry.get_object(), StreamObject):
+                continue
+            references.append(entry if isinstance(entry, IndirectObject) else pdf._add_object(entry))
+        return references
 
     def _expand_mediabox(
         self, page2: "PageObject", ctm: CompressedTransformationMatrix | None
@@ -1762,9 +1798,11 @@ class PageObject(DictionaryObject):
         Compress the size of this page by joining all content streams and
         applying a FlateDecode filter.
 
-        However, it is possible that this function will perform no action if
-        content stream compression becomes "automatic".
+        With the default level, this does nothing for a page in a writer if all
+        of its content streams already use a filter.
         """
+        if level == -1 and self._content_streams_are_filtered():
+            return
         content = self.get_contents()
         if content is not None:
             content_obj = content.flate_encode(level)
@@ -1779,6 +1817,16 @@ class PageObject(DictionaryObject):
                     self.replace_contents(content_obj)
                 else:
                     raise ValueError("Page must be part of a PdfWriter") from exception
+
+    def _content_streams_are_filtered(self) -> bool:
+        """Check if each content stream of this page already uses a filter."""
+        if PG.CONTENTS not in self:
+            return False
+        if self.indirect_reference is None or not hasattr(self.indirect_reference.pdf, "_add_object"):
+            return False
+        contents = self[PG.CONTENTS].get_object()
+        streams: list[Any] = list(contents) if isinstance(contents, ArrayObject) else [contents]
+        return all("/Filter" in stream.get_object() for stream in streams)
 
     @property
     def page_number(self) -> int | None:

@@ -1262,11 +1262,12 @@ CONTENT_STREAM_ARRAY_MAX_LENGTH = 10_000
 
 # One token of the operations which make up nearly all content streams. Anything
 # unusual ends up in the last group, as finditer() would skip it otherwise.
+_CONTENT_WHITESPACE = rb"[\x00\t\n\f\r ]"
 _CONTENT_TOKEN_END = rb"(?=[\t\n\x0b\f\r ()<>\[\]{}/%]|\Z)"
 _CONTENT_NUMBER = rb"[+-]?(?:\d{1,18}(?:\.\d{0,18})?|\.\d{1,18})"
 _CONTENT_OPERANDS = rb"(?:" + _CONTENT_NUMBER + rb"[\t\n\f\r ]+){0,6}"
 _CONTENT_TOKENS = (
-    rb"(" + _CONTENT_OPERANDS + rb")(?!R[^a-zA-Z])([A-Za-z'\"][!-$&'*-.0-;=?-Z\\^-z|~]{0,31})" + _CONTENT_TOKEN_END
+    rb"|(" + _CONTENT_OPERANDS + rb")(?!R[^a-zA-Z])([A-Za-z'\"][!-$&'*-.0-;=?-Z\\^-z|~]{0,31})" + _CONTENT_TOKEN_END
     + rb"|([+-]?\d{1,18})" + _CONTENT_TOKEN_END
     + rb"|([+-]?(?:\d{1,18}\.\d{0,18}|\.\d{1,18}))" + _CONTENT_TOKEN_END
     + rb"|(/[!\"$&'*+,\-.0-9:;=?@A-Z\\^_`a-z|~]*)" + _CONTENT_TOKEN_END
@@ -1276,17 +1277,37 @@ _CONTENT_TOKENS = (
     rb"|(\[)|(\])"
     rb"|([\s\S]))"
 )
-_CONTENT_TOKEN_PATTERN = re.compile(rb"[\x00\t\n\f\r ]*(?:" + _CONTENT_TOKENS)
-_CONTENT_OPERANDS_GROUP = 1
-_CONTENT_OPERATOR = 2
-_CONTENT_INTEGER = 3
-_CONTENT_FLOAT = 4
-_CONTENT_NAME = 5
-_CONTENT_STRING = 6
-_CONTENT_ESCAPED_STRING = 7
-_CONTENT_HEX_STRING = 8
-_CONTENT_ARRAY_START = 9
-_CONTENT_ARRAY_END = 10
+_CONTENT_TOKEN_PATTERN = re.compile(_CONTENT_WHITESPACE + rb"*(?:((?!))" + _CONTENT_TOKENS)
+# Operators which take only numbers and have no influence on the extracted text,
+# and blocks of them which only change the transformation matrix for themselves.
+# The first character must not be whitespace: as whitespace also follows an
+# operator, there would be many ways to match, which takes exponential time.
+_DRAWING_OPERANDS = rb"(?:[-+.0-9][-+.0-9\t\n\f\r ]{0,127})?"
+_DRAWING_OPERATION = (
+    _DRAWING_OPERANDS
+    + rb"(?:[mlcvyhSsfFBbnkKgGwJjMiW]|re|rg|RG|f\*|B\*|b\*|W\*)" + _CONTENT_TOKEN_END
+    + rb"[\t\n\f\r ]*"
+)
+_DRAWING_BLOCK = (
+    rb"q[\t\n\f\r ]+(?:" + _DRAWING_OPERANDS + rb"cm[\t\n\f\r ]+)*(?:" + _DRAWING_OPERATION + rb")*Q"
+    + _CONTENT_TOKEN_END + rb"[\t\n\f\r ]*"
+)
+_TEXT_TOKEN_PATTERN = re.compile(
+    _CONTENT_WHITESPACE + rb"*(?:((?:" + _DRAWING_OPERATION + rb"|" + _DRAWING_BLOCK + rb")+)" + _CONTENT_TOKENS
+)
+# Operators after which text may wait to be flushed, and the one which flushes it.
+_TEXT_STATE_OPERATORS = frozenset((b"BT", b"ET", b"Tj", b"TJ", b"'", b'"', b"Td", b"TD", b"Tm", b"T*"))
+_CONTENT_SKIPPED = 1
+_CONTENT_OPERANDS_GROUP = 2
+_CONTENT_OPERATOR = 3
+_CONTENT_INTEGER = 4
+_CONTENT_FLOAT = 5
+_CONTENT_NAME = 6
+_CONTENT_STRING = 7
+_CONTENT_ESCAPED_STRING = 8
+_CONTENT_HEX_STRING = 9
+_CONTENT_ARRAY_START = 10
+_CONTENT_ARRAY_END = 11
 
 
 class ContentStream(DecodedStreamObject):
@@ -1310,6 +1331,9 @@ class ContentStream(DecodedStreamObject):
     * when .operations is set, ._data is set to None.
     """
     _OPERATOR_LENGTH_LIMIT = 128
+    # Leaves out operators without an influence on text extraction.
+    _skip_drawing_operations = False
+    _text_pending = False
 
     def __init__(
         self,
@@ -1506,6 +1530,8 @@ class ContentStream(DecodedStreamObject):
                 else:
                     self._check_limits(parsing_budget=parsing_budget, token_decrement=1)
                     self._operations.append((operands, operator))
+                    if operator in _TEXT_STATE_OPERATORS:
+                        self._text_pending = operator != b"ET"
                     operands = []
             elif peek == b"%":
                 # If we encounter a comment in the content stream, we have to
@@ -1535,9 +1561,11 @@ class ContentStream(DecodedStreamObject):
         data = cast(BytesIO, stream).getvalue()
         forced_encoding = self.forced_encoding
         append_operation = self._operations.append
+        pattern = _TEXT_TOKEN_PATTERN if self._skip_drawing_operations else _CONTENT_TOKEN_PATTERN
+        text_pending = self._text_pending
         budget = parsing_budget.remaining_budget
         end_of_operation = stream.tell()
-        tokens = _CONTENT_TOKEN_PATTERN.finditer(data, end_of_operation)
+        tokens = pattern.finditer(data, end_of_operation)
         spent = 0
         array_elements = 0
         operands: list[Any] = []
@@ -1545,6 +1573,11 @@ class ContentStream(DecodedStreamObject):
         while (token := next(tokens, None)) is not None:
             kind = token.lastindex
             value: Any
+            if kind == _CONTENT_SKIPPED:
+                if operands or array is not None or (text_pending and b"q" in token[kind]):
+                    break
+                end_of_operation = token.end()
+                continue
             if kind == _CONTENT_OPERATOR:
                 operator = token[kind]
                 if array is not None or operator == b"BI":
@@ -1563,6 +1596,8 @@ class ContentStream(DecodedStreamObject):
                     spent -= len(operands) + array_elements + 1
                     break
                 append_operation((operands, operator))
+                if operator in _TEXT_STATE_OPERATORS:
+                    text_pending = operator != b"ET"
                 array_elements = 0
                 operands = []
                 end_of_operation = token.end()
@@ -1578,7 +1613,7 @@ class ContentStream(DecodedStreamObject):
             elif kind == _CONTENT_ESCAPED_STRING:
                 stream.seek(token.start(kind))
                 value = read_string_from_stream(stream, forced_encoding)
-                tokens = _CONTENT_TOKEN_PATTERN.finditer(data, stream.tell())
+                tokens = pattern.finditer(data, stream.tell())
             elif kind == _CONTENT_HEX_STRING:
                 digits = token[kind]
                 if len(digits) % 2:
@@ -1602,6 +1637,7 @@ class ContentStream(DecodedStreamObject):
             else:
                 array.append(value)
         parsing_budget.remaining_budget -= spent
+        self._text_pending = text_pending
         stream.seek(end_of_operation)
 
     def _read_inline_image(self, stream: StreamType, parsing_budget: StreamParsingBudget) -> dict[str, Any]:

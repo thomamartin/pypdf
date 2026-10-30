@@ -974,6 +974,7 @@ def test_content_stream__plain_operations_stop_at_token_limit(data, monkeypatch)
 
 
 @pytest.mark.timeout(10)
+@pytest.mark.parametrize("skip_drawing_operations", [False, True])
 @pytest.mark.parametrize(
     "data",
     [
@@ -985,8 +986,31 @@ def test_content_stream__plain_operations_stop_at_token_limit(data, monkeypatch)
         b"q " * 10_000,
     ],
 )
-def test_content_stream__reading_stays_linear_for_failing_matches(data) -> None:
+def test_content_stream__reading_stays_linear_for_failing_matches(data, skip_drawing_operations) -> None:
     """A match which fails late must not make the regular expressions backtrack exponentially."""
     content_stream = ContentStream(stream=None, pdf=None)
+    content_stream._skip_drawing_operations = skip_drawing_operations
     with contextlib.suppress(PdfReadError):
         content_stream._parse_content_stream(BytesIO(data))
+
+
+@pytest.mark.parametrize(
+    ("data", "expected_operators"),
+    [
+        (b"1 2 m 3 4 l S 1 0 0 rg 0 g", []),
+        (b"q 1 0 0 1 5 5 cm 1 2 m S Q BT ET", [b"BT", b"ET"]),
+        (b"BT ET q 2 w Q", [b"BT", b"ET"]),
+        # A transformation flushes pending text, so it must not be left out.
+        (b"BT (a) Tj q 1 0 0 1 5 5 cm 1 2 m S Q ET", [b"BT", b"Tj", b"q", b"cm", b"Q", b"ET"]),
+        # A block which contains anything else is not left out either.
+        (b"q /X Do Q", [b"q", b"Do", b"Q"]),
+        (b"q 1 2 m", [b"q"]),
+        # Operands in front of the skipped operators belong to an operation.
+        (b"(a) 1 2 m", [b"m"]),
+    ],
+)
+def test_content_stream__skip_drawing_operations(data, expected_operators) -> None:
+    content_stream = ContentStream(stream=None, pdf=None)
+    content_stream._skip_drawing_operations = True
+    content_stream._parse_content_stream(BytesIO(data))
+    assert [operator for _, operator in content_stream._operations] == expected_operators

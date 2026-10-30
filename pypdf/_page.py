@@ -1897,6 +1897,9 @@ class PageObject(DictionaryObject):
             )
             if not isinstance(content, ContentStream):
                 content = ContentStream(content, pdf, "bytes")
+                content._skip_drawing_operations = (
+                    visitor_operand_before is None and visitor_operand_after is None and visitor_text is None
+                )
         except (AttributeError, KeyError):  # no content can be extracted (certainly empty page)
             return ""
         # We check all strings are TextStringObjects. ByteStringObjects

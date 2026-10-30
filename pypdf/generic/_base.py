@@ -471,6 +471,7 @@ class IndirectObject(PdfObject):
 FLOAT_WRITE_PRECISION = 8  # shall be min 5 digits max, allow user adj
 
 
+_PDFDOC_CHARACTERS = frozenset(_pdfdoc_encoding_rev)
 _UNSAFE_STRING_BYTE = re.compile(rb"[^0-9A-Za-z ]")
 
 
@@ -674,13 +675,11 @@ class TextStringObject(str, PdfObject):  # noqa: SLOT000
             text_string_object._original_bytes = original_bytes
             text_string_object.autodetect_utf16 = True
             text_string_object.utf16_bom = original_bytes[:2]
+        elif _PDFDOC_CHARACTERS.issuperset(text_string_object):
+            text_string_object.autodetect_pdfdocencoding = True
         else:
-            try:
-                encode_pdfdocencoding(text_string_object)
-                text_string_object.autodetect_pdfdocencoding = True
-            except UnicodeEncodeError:
-                text_string_object.autodetect_utf16 = True
-                text_string_object.utf16_bom = codecs.BOM_UTF16_BE
+            text_string_object.autodetect_utf16 = True
+            text_string_object.utf16_bom = codecs.BOM_UTF16_BE
         return text_string_object
 
     def clone(

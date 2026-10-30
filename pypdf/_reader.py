@@ -85,12 +85,17 @@ from .generic import (
     StreamObject,
     TextStringObject,
     is_null_or_none,
+    read_indirect_object,
     read_object,
 )
 from .xmp import XmpInformation
 
 if TYPE_CHECKING:
     from ._page import PageObject
+
+
+# The usual form of an object header, without any superfluous whitespace.
+_OBJECT_HEADER_PATTERN = re.compile(rb"(\d{1,20}) (\d{1,20}) obj[\x00\t\n\f\r ]*(?=[\s\S])")
 
 
 class PdfReader(PdfDocCommon):
@@ -508,7 +513,7 @@ class PdfReader(PdfDocCommon):
                 stream_data.seek(-1, 1)
 
                 try:
-                    obj = read_object(stream_data, self)
+                    obj = read_indirect_object(stream_data, self)
                 except PdfStreamError as exc:
                     # Stream object cannot be read. Normally, a critical error, but
                     # Adobe Reader doesn't complain, so continue (in strict mode?)
@@ -627,7 +632,7 @@ class PdfReader(PdfDocCommon):
             if current_object in self._known_objects:
                 raise LimitReachedError(f"Detected loop with self reference for {indirect_reference!r}.")
             self._known_objects.add(current_object)
-            retval = read_object(self.stream, self)
+            retval = read_indirect_object(self.stream, self)
             self._known_objects.remove(current_object)
 
             # override encryption is used for the /Encrypt dictionary
@@ -697,6 +702,11 @@ class PdfReader(PdfDocCommon):
         return retval
 
     def read_object_header(self, stream: StreamType) -> tuple[int, int]:
+        if isinstance(stream, BytesIO):
+            header = _OBJECT_HEADER_PATTERN.match(stream.getvalue(), stream.tell())
+            if header is not None:
+                stream.seek(header.end())
+                return int(header[1]), int(header[2])
         # Should never be necessary to read out whitespace, since the
         # cross-reference table should put us in the right spot to read the
         # object header. In reality some files have stupid cross-reference

@@ -3325,7 +3325,7 @@ def test_get_object_from_stream__read_object_raises_and_warns(caplog):
     with mock.patch.object(reader, "get_object", return_value=obj_stm), \
             mock.patch.object(reader, "cache_get_indirect_object", return_value=None), \
             mock.patch.object(reader, "cache_indirect_object", side_effect=cache_indirect_object), \
-            mock.patch("pypdf._reader.read_object", side_effect=lambda *_: (_ for _ in ()).throw(exc)):
+            mock.patch("pypdf._reader.read_indirect_object", side_effect=lambda *_: (_ for _ in ()).throw(exc)):
         result = reader._get_object_from_stream(IndirectObject(1, 0, reader))
 
     assert isinstance(result, NullObject)

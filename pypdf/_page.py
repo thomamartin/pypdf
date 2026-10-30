@@ -27,6 +27,7 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
+import functools
 import math
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from copy import deepcopy
@@ -550,6 +551,39 @@ class VirtualListImages(Sequence[ImageFile]):
     def __str__(self) -> str:
         p = [f"Image_{i}={n}" for i, n in enumerate(self.ids_function())]
         return f"[{', '.join(p)}]"
+
+
+@functools.lru_cache(maxsize=16)
+def _rename_resources(data: bytes, rename: tuple[tuple[Any, Any], ...]) -> bytes:
+    """
+    Rename resources in a content stream.
+
+    Merging a stamp onto many pages often needs the same names to be replaced,
+    so this avoids parsing the same stream for each page.
+
+    Args:
+        data: The content stream.
+        rename: The pairs of the old and the new name.
+
+    Returns:
+        The updated content stream.
+
+    """
+    renamed = dict(rename)
+    stream = ContentStream(None, None)
+    stream.set_data(data)
+    for operands, _operator in stream.operations:
+        if isinstance(operands, list):
+            for i, op in enumerate(operands):
+                if isinstance(op, NameObject):
+                    operands[i] = renamed.get(op, op)
+        elif isinstance(operands, dict):
+            for i, op in operands.items():
+                if isinstance(op, NameObject):
+                    operands[i] = renamed.get(op, op)
+        else:
+            raise KeyError(f"Type of operands is {type(operands)}")
+    return stream.get_data()
 
 
 class PageObject(DictionaryObject):
@@ -1090,17 +1124,7 @@ class PageObject(DictionaryObject):
         if not rename:
             return stream
         stream = ContentStream(stream, pdf)
-        for operands, _operator in stream.operations:
-            if isinstance(operands, list):
-                for i, op in enumerate(operands):
-                    if isinstance(op, NameObject):
-                        operands[i] = rename.get(op, op)
-            elif isinstance(operands, dict):
-                for i, op in operands.items():
-                    if isinstance(op, NameObject):
-                        operands[i] = rename.get(op, op)
-            else:
-                raise KeyError(f"Type of operands is {type(operands)}")
+        stream.set_data(_rename_resources(stream.get_data(), tuple(rename.items())))
         return stream
 
     @staticmethod

@@ -101,6 +101,7 @@ IndirectPattern = re.compile(rb"[+-]?(\d+)\s+(\d+)\s+R[^a-zA-Z]")
 # Large arrays consist mostly of them, for example in the /ParentTree of the
 # structure tree, so the clone loops check the exact type first and skip the
 # slower isinstance() checks.
+_CHAIN_FIELDS = frozenset(("/Next", "/Prev", "/N", "/V"))
 _SCALAR_TYPES = frozenset(
     (BooleanObject, ByteStringObject, FloatObject, NameObject, NullObject, NumberObject, TextStringObject)
 )
@@ -143,7 +144,12 @@ class ArrayObject(list[Any], PdfObject):
         for data in self:
             if type(data) in _SCALAR_TYPES:
                 # Same as the generic case below, but without the isinstance() checks.
-                arr.append(data.clone(pdf_dest, force_duplicate, ignore_fields))
+                # Direct scalars are immutable and can be shared with the source.
+                arr.append(
+                    data.clone(pdf_dest, force_duplicate, ignore_fields)
+                    if hasattr(data, "indirect_reference")
+                    else data
+                )
             elif isinstance(data, StreamObject):
                 dup = data._reference_clone(
                     data.clone(pdf_dest, force_duplicate, ignore_fields),
@@ -375,7 +381,7 @@ class DictionaryObject(dict[Any, Any], PdfObject):
                 ignore_fields[x] -= 1  # type: ignore[operator]
             x += 1
         #  Check if this is a chain list, we need to loop to prevent recur
-        if any(
+        if not _CHAIN_FIELDS.isdisjoint(src) and any(
             field not in ignore_fields
             and field in src
             and isinstance(src.raw_get(field), IndirectObject)
@@ -455,6 +461,10 @@ class DictionaryObject(dict[Any, Any], PdfObject):
                     assert vv.indirect_reference is not None
                     self[k.clone(pdf_dest)] = vv.indirect_reference
                 elif k not in self:
+                    if type(v) in _SCALAR_TYPES and not hasattr(v, "indirect_reference"):
+                        # Direct scalars are immutable and can be shared with the source.
+                        dict.__setitem__(self, NameObject(k), v)
+                        continue
                     self[NameObject(k)] = (
                         v.clone(pdf_dest, force_duplicate, ignore_fields)
                         if hasattr(v, "clone")

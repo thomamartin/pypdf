@@ -770,7 +770,7 @@ class TextStringObject(str, PdfObject):  # noqa: SLOT000
 
 
 class NameObject(str, PdfObject):  # noqa: SLOT000
-    delimiter_pattern = re.compile(rb"\s+|[\(\)<>\[\]{}/%]")
+    delimiter_pattern = re.compile(rb"[\s\x00]+|[\(\)<>\[\]{}/%]")
     prefix = b"/"
     renumber_table: ClassVar[dict[str, bytes]] = {
         **{chr(i): f"#{i:02X}".encode() for i in b"#()<>[]{}/%"},

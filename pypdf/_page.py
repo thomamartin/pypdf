@@ -1798,9 +1798,11 @@ class PageObject(DictionaryObject):
         Compress the size of this page by joining all content streams and
         applying a FlateDecode filter.
 
-        However, it is possible that this function will perform no action if
-        content stream compression becomes "automatic".
+        With the default level, this does nothing for a page in a writer if all
+        of its content streams already use a filter.
         """
+        if level == -1 and self._content_streams_are_filtered():
+            return
         content = self.get_contents()
         if content is not None:
             content_obj = content.flate_encode(level)
@@ -1815,6 +1817,16 @@ class PageObject(DictionaryObject):
                     self.replace_contents(content_obj)
                 else:
                     raise ValueError("Page must be part of a PdfWriter") from exception
+
+    def _content_streams_are_filtered(self) -> bool:
+        """Check if each content stream of this page already uses a filter."""
+        if PG.CONTENTS not in self:
+            return False
+        if self.indirect_reference is None or not hasattr(self.indirect_reference.pdf, "_add_object"):
+            return False
+        contents = self[PG.CONTENTS].get_object()
+        streams: list[Any] = list(contents) if isinstance(contents, ArrayObject) else [contents]
+        return all("/Filter" in stream.get_object() for stream in streams)
 
     @property
     def page_number(self) -> int | None:

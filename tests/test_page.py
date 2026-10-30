@@ -379,7 +379,7 @@ def test_compress_content_streams_releases_replaced_streams():
     ]
 
     for page in writer.pages:
-        page.compress_content_streams()
+        page.compress_content_streams(level=9)
 
     # The streams the compressed one replaces have been released ...
     assert all(isinstance(writer._objects[idnum - 1], NullObject) for idnum in replaced)

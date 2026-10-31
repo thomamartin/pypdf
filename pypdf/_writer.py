@@ -54,6 +54,7 @@ else:
 from ._doc_common import DocumentInformation, PdfDocCommon
 from ._encryption import EncryptAlgorithm, Encryption
 from ._font_compression import remove_unused_font_tables
+from ._image_palette import use_palette
 from ._jpeg_optimization import is_available as jpeg_optimization_is_available
 from ._jpeg_optimization import optimize_jpegs
 from ._page import PageObject, Transformation
@@ -1789,9 +1790,10 @@ class PdfWriter(PdfDocCommon):
         """
         Make the file as small as possible without changing its content.
 
-        This merges identical objects, removes unreferenced objects, compresses the
-        streams again if that makes them smaller, and enables
-        :attr:`use_object_streams`. Images are not re-encoded in a lossy way.
+        This merges identical objects, removes unreferenced objects and page
+        thumbnails, which PDF readers can create themselves, compresses the streams
+        again if that makes them smaller, removes font tables which PDF does not use,
+        and enables :attr:`use_object_streams`.
         Recommended to be used just before writing output.
 
         The output needs PDF 1.5. For PDF/A files, no metadata stream gets compressed,
@@ -1822,6 +1824,8 @@ class PdfWriter(PdfDocCommon):
         if image_max_dpi is not None and image_max_dpi <= 0:
             raise ValueError(f"image_max_dpi must be positive, got {image_max_dpi}.")
 
+        for page in self.pages:
+            page.pop("/Thumb", None)
         self.compress_identical_objects(remove_duplicates=True, remove_unreferenced=True)
         if image_quality is not None or image_max_dpi is not None:
             self._compress_images(level, image_quality, image_max_dpi)
@@ -1937,6 +1941,7 @@ class PdfWriter(PdfDocCommon):
             if obj.indirect_reference == document_metadata or (keep_all_metadata and obj.get("/Type") == "/Metadata"):
                 continue
             if isinstance(obj, EncodedStreamObject):
+                use_palette(obj, level)
                 if not obj._add_png_predictor(level):
                     obj._recompress_flate(level)
             elif StreamAttributes.FILTER not in obj:

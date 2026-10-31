@@ -337,3 +337,13 @@ def test_use_group4__needs_the_usual_bit_order():
         output, "TIFF", compression="group4", tiffinfo={278: 500, 266: 2}
     )
     assert _read_single_strip(output) is None
+
+
+def test_read_single_strip__only_reads_files_of_pillow():
+    assert _read_single_strip(BytesIO(b"MM\x00*" + bytes(20))) is None
+
+
+def test_use_group4__pillow_cannot_write_the_file():
+    stream = _bilevel_stream(_scan(600, 500), 600, 500)
+    with mock.patch("PIL.Image.Image.save", side_effect=OSError("encoder error -2")):
+        assert use_group4(stream) is False

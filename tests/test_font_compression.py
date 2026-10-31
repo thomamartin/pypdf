@@ -9,7 +9,7 @@ from fontTools.ttLib import TTFont
 
 from pypdf import PdfWriter
 from pypdf._font_compression import remove_unused_font_tables
-from pypdf.generic import DictionaryObject, EncodedStreamObject, NameObject, NumberObject
+from pypdf.generic import DictionaryObject, EncodedStreamObject, NameObject, NumberObject, StreamObject
 
 from . import RESOURCE_ROOT
 
@@ -137,3 +137,17 @@ def test_compress__keeps_broken_font_files():
 
     assert stream._data == data
     assert stream["/Length1"] == len(FONT)
+
+
+def test_compress__ignores_font_files_which_are_not_flate_streams():
+    plain = StreamObject()
+    plain.set_data(FONT)
+    writer, _ = _writer_with_font(_font_stream(b"not used"))
+    writer.root_object["/TestDescriptor"].get_object()[NameObject("/FontFile2")] = writer._add_object(plain)
+    writer.root_object[NameObject("/TestDirect")] = writer._add_object(
+        DictionaryObject({NameObject("/FontFile2"): NameObject("/NotAStream")})
+    )
+
+    writer.compress()
+
+    assert writer.root_object["/TestDescriptor"]["/FontFile2"].get_data() == FONT

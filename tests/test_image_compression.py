@@ -213,6 +213,19 @@ def test_compress_image__keeps_broken_jpeg():
     assert compress_image(stream, 9, 75, 1.0) is None
 
 
+def test_compress_image__keeps_jpeg_below_another_filter():
+    stream = _stream(_photo())
+    stream[NameObject("/Filter")] = ArrayObject([NameObject("/ASCII85Decode"), NameObject("/DCTDecode")])
+    assert compress_image(stream, 9, 50, 1.0) is None
+
+
+def test_compress_image__keeps_jpeg_below_broken_flate():
+    stream = _stream(_photo())
+    stream[NameObject("/Filter")] = ArrayObject([NameObject("/FlateDecode"), NameObject("/DCTDecode")])
+    stream._data = b"This is not Flate."
+    assert compress_image(stream, 9, 50, 1.0) is None
+
+
 def test_compress_image__keeps_huge_images_which_pillow_refuses():
     stream = _stream(_photo())
     stream[NameObject("/Filter")] = NameObject("/DCTDecode")

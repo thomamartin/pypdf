@@ -228,6 +228,8 @@ class PdfWriter(PdfDocCommon):
         for incremental updates.
         """
 
+        self._object_stream_level = 9
+
         self._objects = []
 
         self._original_hash: list[int] = []
@@ -1603,8 +1605,7 @@ class PdfWriter(PdfDocCommon):
         # Signing tools replace the placeholders of a signature within the file.
         return not (isinstance(obj, DictionaryObject) and "/ByteRange" in obj)
 
-    @staticmethod
-    def _create_object_stream(objects: list[tuple[int, PdfObject]]) -> StreamObject:
+    def _create_object_stream(self, objects: list[tuple[int, PdfObject]]) -> StreamObject:
         offsets = []
         data = BytesIO()
         for idnum, obj in objects:
@@ -1618,7 +1619,7 @@ class PdfWriter(PdfDocCommon):
         object_stream[NameObject("/N")] = NumberObject(len(objects))
         object_stream[NameObject("/First")] = NumberObject(len(header))
         object_stream.set_data(header + data.getvalue())
-        return object_stream.flate_encode(level=9)
+        return object_stream.flate_encode(level=self._object_stream_level)
 
     def _create_cross_reference_stream(self, entries: dict[int, tuple[int, int, int]]) -> StreamObject:
         field_size = (max(entry[1] for entry in entries.values()).bit_length() + 7) // 8
@@ -1642,7 +1643,7 @@ class PdfWriter(PdfDocCommon):
             [NumberObject(1), NumberObject(field_size), NumberObject(2)]
         )
         xref_stream.set_data(bytes(data))
-        encoded_stream = xref_stream.flate_encode(level=9)
+        encoded_stream = xref_stream.flate_encode(level=self._object_stream_level)
         encoded_stream[NameObject("/DecodeParms")] = DictionaryObject(
             {NameObject("/Columns"): NumberObject(row_size), NameObject("/Predictor"): NumberObject(12)}
         )
@@ -1778,7 +1779,7 @@ class PdfWriter(PdfDocCommon):
                 if idnum not in reachable:
                     self._objects[idnum - 1] = None
 
-    def compress(self, level: int = 9) -> None:
+    def compress(self, level: int = 10) -> None:
         """
         Make the file as small as possible without changing its content.
 
@@ -1791,8 +1792,10 @@ class PdfWriter(PdfDocCommon):
         and PDF/A-1 files do not get object streams as that part forbids them.
 
         Args:
-            level: The zlib compression level for the streams, from 1 (fastest)
-                to 9 (smallest).
+            level: The compression level for the streams, from 1 (fastest) to
+                12 (smallest). Levels above 9 need the ``deflate`` package,
+                otherwise they mean level 9. It takes about as long as zlib but
+                gives smaller files, and all PDF readers can decode its output.
 
         """
         if self.incremental:
@@ -1805,6 +1808,7 @@ class PdfWriter(PdfDocCommon):
         except PdfReadError:
             pdfa_part = None
         self._recompress_streams(level, keep_all_metadata=pdfa_part is not None)
+        self._object_stream_level = level
         self.use_object_streams = str(pdfa_part) != "1"
 
     def _recompress_streams(self, level: int, keep_all_metadata: bool) -> None:

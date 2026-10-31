@@ -90,6 +90,15 @@ FLATE_MAX_BUFFER_SIZE = 75_000_000  # DEPRECATED: Use pypdf.Configuration.
 _SINGLE_BYTES = tuple(bytes((i,)) for i in range(256))
 
 
+@lru_cache(maxsize=1)
+def _get_libdeflate() -> Any:
+    try:
+        import deflate  # noqa: PLC0415
+    except ImportError:
+        return None
+    return deflate
+
+
 def _decompress_with_limit(data: bytes) -> bytes:
     decompressor = zlib.decompressobj()
     configuration = get_configuration()
@@ -342,11 +351,19 @@ class FlateDecode:
         Args:
             data: The data to be compressed.
             level: See https://docs.python.org/3/library/zlib.html#zlib.compress
+                Levels from 10 to 12 compress better with libdeflate, which needs
+                the ``deflate`` package. Without it, they mean level 9. Every
+                reader can decode the result, as it has the same format.
 
         Returns:
             The compressed data.
 
         """
+        if level > 9:
+            libdeflate = _get_libdeflate()
+            if libdeflate is not None:
+                return cast(bytes, libdeflate.zlib_compress(data, level))
+            level = 9
         return zlib.compress(data, level)
 
 

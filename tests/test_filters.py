@@ -27,6 +27,7 @@ from pypdf.filters import (
     JBIG2Decode,
     LZWDecode,
     RunLengthDecode,
+    _get_libdeflate,
     decode_stream_data,
     decompress,
 )
@@ -1585,3 +1586,35 @@ def test_decode_stream_data__data_limit() -> None:
             match=r"^Stream decoding exceeded the maximum accumulated decoding work of 300000000 bytes\.$"
     ):
         decode_stream_data(content_stream)
+
+
+def test_flate_decode_encode__levels_of_libdeflate():
+    data = b"Some repetitive data. " * 100
+
+    with mock.patch("pypdf.filters._get_libdeflate", return_value=None):
+        assert FlateDecode.encode(data, 12) == zlib.compress(data, 9)
+
+    libdeflate = mock.Mock()
+    libdeflate.zlib_compress.return_value = b"compressed"
+    with mock.patch("pypdf.filters._get_libdeflate", return_value=libdeflate):
+        assert FlateDecode.encode(data, 12) == b"compressed"
+        assert FlateDecode.encode(data, 9) == zlib.compress(data, 9)
+        assert FlateDecode.encode(data) == zlib.compress(data)
+    libdeflate.zlib_compress.assert_called_once_with(data, 12)
+
+
+def test_flate_decode_encode__libdeflate_is_optional():
+    _get_libdeflate.cache_clear()
+    try:
+        with mock.patch.dict(sys.modules, {"deflate": None}):
+            assert _get_libdeflate() is None
+    finally:
+        _get_libdeflate.cache_clear()
+
+
+def test_flate_decode_encode__output_of_libdeflate():
+    pytest.importorskip("deflate")
+    data = b"Some repetitive data with a few numbers. 0 1 2 3 4 5 6 7 8 9\n" * 1000
+    encoded = FlateDecode.encode(data, 12)
+    assert zlib.decompress(encoded) == data
+    assert FlateDecode.decode(encoded) == data

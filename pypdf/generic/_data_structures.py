@@ -1274,6 +1274,8 @@ class EncodedStreamObject(StreamObject):
         Streams which do not decode cleanly stay as they are, as pypdf's lenient
         decoding could lose data for them.
         """
+        from ..filters import FlateDecode  # noqa: PLC0415
+
         filters = self.get(StreamAttributes.FILTER)
         outer_filter = filters[0] if isinstance(filters, ArrayObject) and filters else filters
         if outer_filter not in (FT.FLATE_DECODE, FTA.FL):
@@ -1286,11 +1288,11 @@ class EncodedStreamObject(StreamObject):
                 beginning = zlib.decompressobj().decompress(probe, max_length=limit)
             except zlib.error:
                 return
-            if len(zlib.compress(beginning, level)) >= 0.99 * _RECOMPRESSION_PROBE_SIZE:
+            if len(FlateDecode.encode(beginning, level)) >= 0.99 * _RECOMPRESSION_PROBE_SIZE:
                 return
         data = self._decode_flate_exactly()
         if data is not None:
-            compressed = zlib.compress(data, level)
+            compressed = FlateDecode.encode(data, level)
             if len(compressed) < len(self._data):
                 self._data = compressed
 
@@ -1302,6 +1304,8 @@ class EncodedStreamObject(StreamObject):
             True if the stream has a new encoding.
 
         """
+        from ..filters import FlateDecode  # noqa: PLC0415
+
         if self.get("/Subtype") != "/Image" or StreamAttributes.DECODE_PARMS in self:
             return False
         if not self._is_only_flate_encoded():
@@ -1338,7 +1342,7 @@ class EncodedStreamObject(StreamObject):
         if predicted_size >= 0.97 * unpredicted_size:
             return False
 
-        compressed = zlib.compress(_apply_png_predictor(data, row_size, pixel_size, predictor), level)
+        compressed = FlateDecode.encode(_apply_png_predictor(data, row_size, pixel_size, predictor), level)
         if len(compressed) >= len(self._data):
             return False
         self._data = compressed

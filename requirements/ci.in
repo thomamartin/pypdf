@@ -1,6 +1,7 @@
 arabic-reshaper
 brotli
 coverage
+deflate
 fonttools
 fpdf2
 mypy

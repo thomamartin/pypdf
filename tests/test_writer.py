@@ -1,8 +1,11 @@
 """Test the pypdf._writer module."""
 
+import base64
+import os
 import re
 import shutil
 import subprocess
+import zlib
 from io import BytesIO
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -45,6 +48,7 @@ from pypdf.generic import (
 )
 from pypdf.generic._font import Font
 from pypdf.generic._viewerpref import BOX_NAMES
+from pypdf.xmp import XmpInformation
 
 from . import RESOURCE_ROOT, SAMPLE_ROOT, get_data_from_url, is_sublist
 from .test_images import image_similarity
@@ -4342,3 +4346,223 @@ def test_use_object_streams__encryption(algorithm):
     reader = PdfReader(output, password="password", strict=True)
     assert reader.metadata.title == "A secret title"
     assert reader.pages[0].extract_text() == expected_text
+
+
+def test_compress():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    expected_text = writer.pages[0].extract_text()
+    streams = []
+    for _ in range(2):
+        stream = StreamObject()
+        stream.set_data(b"Some very repetitive data. " * 1000)
+        streams.append(writer._add_object(stream))
+    writer.root_object[NameObject("/TestStreams")] = ArrayObject(streams)
+    unused = writer._add_object(DictionaryObject())
+
+    writer.compress()
+
+    assert writer.use_object_streams is True
+    assert writer._objects[unused.idnum - 1] is None
+    output = BytesIO()
+    writer.write(output)
+    reader = PdfReader(output, strict=True)
+    assert reader.pages[0].extract_text() == expected_text
+    kept = reader.root_object["/TestStreams"]
+    assert kept[0] == kept[1]
+    assert kept[0].get_object().get_data() == b"Some very repetitive data. " * 1000
+    assert kept[0].get_object()["/Filter"] == "/FlateDecode"
+    assert len(kept[0].get_object()._data) < 200
+
+
+def test_compress__not_for_incremental_updates():
+    writer = PdfWriter(RESOURCE_ROOT / "crazyones.pdf", incremental=True)
+    with pytest.raises(NotImplementedError, match=r"^Compressing incremental updates is not supported\.$"):
+        writer.compress()
+
+
+def test_compress__after_compressing_content_streams():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    expected_text = writer.pages[0].extract_text()
+    writer.pages[0].compress_content_streams(level=9)
+    writer.compress()
+    output = BytesIO()
+    writer.write(output)
+    assert PdfReader(output).pages[0].extract_text() == expected_text
+
+
+def test_compress__encoded_content_stream():
+    """Content streams which pypdf changed are objects of their own type."""
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=100, height=100)
+    page.merge_page(PdfReader(RESOURCE_ROOT / "crazyones.pdf").pages[0])
+    expected_text = page.extract_text()
+    writer.compress()
+    output = BytesIO()
+    writer.write(output)
+    assert PdfReader(output).pages[0].extract_text() == expected_text
+
+
+def test_compress__leaves_small_streams_unfiltered():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    stream = StreamObject()
+    stream.set_data(b"x" * 20)
+    reference = writer._add_object(stream)
+    writer.root_object[NameObject("/TestStream")] = reference
+
+    writer.compress()
+
+    assert "/Filter" not in reference.get_object()
+
+
+def _add_metadata_streams(writer: PdfWriter, pdfa_part: str | None) -> IndirectObject:
+    xmp = XmpInformation.create()
+    xmp.pdfaid_part = pdfa_part
+    xmp.dc_title = {"x-default": "Compressible metadata " * 100}
+    writer.xmp_metadata = xmp
+
+    stream = StreamObject()
+    stream[NameObject("/Type")] = NameObject("/Metadata")
+    stream.set_data(b"<metadata>Compressible metadata</metadata>" * 100)
+    reference = writer._add_object(stream)
+    writer.pages[0][NameObject("/Metadata")] = reference
+    return reference
+
+
+@pytest.mark.parametrize(
+    ("pdfa_part", "object_streams", "page_metadata_compressed"),
+    [(None, True, True), ("1", False, False), ("2", True, False), ("3", True, False)],
+)
+def test_compress__keeps_metadata_and_pdfa(pdfa_part, object_streams, page_metadata_compressed):
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    page_metadata = _add_metadata_streams(writer, pdfa_part)
+
+    writer.compress()
+
+    assert "/Filter" not in writer.root_object["/Metadata"]
+    assert ("/Filter" in page_metadata.get_object()) is page_metadata_compressed
+    assert writer.use_object_streams is object_streams
+
+
+def test_compress__ignores_invalid_xmp():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    stream = StreamObject()
+    stream[NameObject("/Type")] = NameObject("/Metadata")
+    stream.set_data(b"This is not XML.")
+    writer.root_object[NameObject("/Metadata")] = writer._add_object(stream)
+
+    writer.compress()
+
+    assert writer.use_object_streams is True
+
+
+def _encoded_stream(data: bytes, filters: NameObject | ArrayObject | None = None) -> EncodedStreamObject:
+    stream = EncodedStreamObject()
+    stream[NameObject("/Filter")] = NameObject("/FlateDecode") if filters is None else filters
+    stream._data = data
+    return stream
+
+
+REPETITIVE_DATA = b"Some repetitive data with a few numbers. 0 1 2 3 4 5 6 7 8 9\n" * 200
+
+
+@pytest.mark.parametrize("flate_name", ["/FlateDecode", "/Fl"])
+def test_recompress_flate(flate_name):
+    data = zlib.compress(REPETITIVE_DATA, 1)
+    stream = _encoded_stream(data, NameObject(flate_name))
+
+    stream._recompress_flate(9)
+
+    assert len(stream._data) < len(data)
+    assert zlib.decompress(stream._data) == REPETITIVE_DATA
+
+
+def test_recompress_flate__only_touches_the_outer_filter():
+    data = zlib.compress(base64.a85encode(REPETITIVE_DATA) + b"~>", 1)
+    stream = _encoded_stream(data, ArrayObject([NameObject("/FlateDecode"), NameObject("/ASCII85Decode")]))
+    parameters = ArrayObject([DictionaryObject({NameObject("/Test"): NumberObject(1)}), NullObject()])
+    stream[NameObject("/DecodeParms")] = parameters
+
+    stream._recompress_flate(9)
+
+    assert len(stream._data) < len(data)
+    assert stream["/DecodeParms"] == parameters
+    assert stream["/Filter"] == ["/FlateDecode", "/ASCII85Decode"]
+    assert stream.get_data() == REPETITIVE_DATA
+
+
+def test_recompress_flate__keeps_the_data_if_it_gets_larger():
+    data = zlib.compress(REPETITIVE_DATA, 9)
+    stream = _encoded_stream(data)
+    stream._recompress_flate(1)
+    assert stream._data == data
+
+
+@pytest.mark.parametrize(
+    "filters",
+    [
+        NameObject("/ASCII85Decode"),
+        NameObject("/DCTDecode"),
+        ArrayObject([NameObject("/ASCII85Decode"), NameObject("/FlateDecode")]),
+        ArrayObject(),
+    ],
+)
+def test_recompress_flate__ignores_other_filters(filters):
+    data = zlib.compress(REPETITIVE_DATA, 1)
+    stream = _encoded_stream(data, filters)
+    stream._recompress_flate(9)
+    assert stream._data == data
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param(zlib.compress(REPETITIVE_DATA, 1)[:-20], id="truncated"),
+        pytest.param(zlib.compress(REPETITIVE_DATA, 1)[:-4] + b"BAD!", id="wrong checksum"),
+        pytest.param(zlib.compress(REPETITIVE_DATA, 1) + b"more data", id="trailing data"),
+        pytest.param(b"This is not Flate.", id="no flate data"),
+    ],
+)
+def test_recompress_flate__keeps_streams_which_do_not_decode_cleanly(data):
+    stream = _encoded_stream(data)
+    stream._recompress_flate(9)
+    assert stream._data == data
+
+
+def test_recompress_flate__accepts_trailing_whitespace():
+    data = zlib.compress(REPETITIVE_DATA, 1) + b"\r\n"
+    stream = _encoded_stream(data)
+    stream._recompress_flate(9)
+    assert len(stream._data) < len(data)
+    assert zlib.decompress(stream._data) == REPETITIVE_DATA
+
+
+def test_recompress_flate__respects_the_decompression_limit():
+    data = zlib.compress(REPETITIVE_DATA, 1)
+    stream = _encoded_stream(data)
+    with mock.patch("pypdf.generic._data_structures.get_configuration") as configuration:
+        configuration.return_value.zlib_maximum_output_length = 100
+        stream._recompress_flate(9)
+    assert stream._data == data
+
+
+def test_recompress_flate__skips_large_streams_without_benefit():
+    data = zlib.compress(os.urandom(5 * 64 * 1024), 9)
+    stream = _encoded_stream(data)
+
+    with mock.patch("pypdf.generic._data_structures.zlib.compress", wraps=zlib.compress) as compress:
+        stream._recompress_flate(9)
+
+    assert compress.call_count == 1
+    assert stream._data == data
+
+
+def test_recompress_flate__compresses_large_streams_with_benefit():
+    rows = [b"%d, some text which repeats itself\n" % number for number in range(100_000)]
+    data = zlib.compress(b"".join(rows), 1)
+    assert len(data) > 2 * 64 * 1024
+    stream = _encoded_stream(data)
+
+    stream._recompress_flate(9)
+
+    assert len(stream._data) < len(data)
+    assert zlib.decompress(stream._data) == b"".join(rows)

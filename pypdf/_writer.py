@@ -74,6 +74,7 @@ from .constants import (
     OutlineFontFlag,
     PageLabelStyle,
     PagesAttributes,
+    StreamAttributes,
     UserAccessPermissions,
 )
 from .constants import FieldDictionaryAttributes as FA
@@ -90,6 +91,7 @@ from .generic import (
     Destination,
     DictionaryObject,
     EmbeddedFile,
+    EncodedStreamObject,
     Fit,
     FloatObject,
     IndirectObject,
@@ -1775,6 +1777,52 @@ class PdfWriter(PdfDocCommon):
             for idnum in range(1, len(self._objects) + 1):
                 if idnum not in reachable:
                     self._objects[idnum - 1] = None
+
+    def compress(self, level: int = 9) -> None:
+        """
+        Make the file as small as possible without changing its content.
+
+        This merges identical objects, removes unreferenced objects, compresses the
+        streams again if that makes them smaller, and enables
+        :attr:`use_object_streams`. Images are not re-encoded in a lossy way.
+        Recommended to be used just before writing output.
+
+        The output needs PDF 1.5. For PDF/A files, no metadata stream gets compressed,
+        and PDF/A-1 files do not get object streams as that part forbids them.
+
+        Args:
+            level: The zlib compression level for the streams, from 1 (fastest)
+                to 9 (smallest).
+
+        """
+        if self.incremental:
+            raise NotImplementedError("Compressing incremental updates is not supported.")
+
+        self.compress_identical_objects(remove_duplicates=True, remove_unreferenced=True)
+        try:
+            xmp = self.xmp_metadata
+            pdfa_part = None if xmp is None else xmp.pdfaid_part
+        except PdfReadError:
+            pdfa_part = None
+        self._recompress_streams(level, keep_all_metadata=pdfa_part is not None)
+        self.use_object_streams = str(pdfa_part) != "1"
+
+    def _recompress_streams(self, level: int, keep_all_metadata: bool) -> None:
+        """Compress streams again where that saves space, without any lossy step."""
+        document_metadata = self.root_object.raw_get("/Metadata") if "/Metadata" in self.root_object else None
+        for index, obj in enumerate(self._objects):
+            if not isinstance(obj, StreamObject):
+                continue
+            # Metadata should be readable without PDF tools, see §14.3.2 of the PDF 2.0 specification.
+            if obj.indirect_reference == document_metadata or (keep_all_metadata and obj.get("/Type") == "/Metadata"):
+                continue
+            if isinstance(obj, EncodedStreamObject):
+                obj._recompress_flate(level)
+            elif StreamAttributes.FILTER not in obj:
+                encoded = obj.flate_encode(level)
+                if len(encoded._data) + len(b"/Filter /FlateDecode\n") < len(obj.get_data()):
+                    encoded.indirect_reference = obj.indirect_reference
+                    self._objects[index] = encoded
 
     def _merge_identical_objects(self, remove_duplicates: bool) -> bool:
         """Keep one of each group of identical objects, and tell if there were any others."""

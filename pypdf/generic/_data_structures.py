@@ -32,6 +32,7 @@ import logging
 import os
 import re
 import sys
+import zlib
 from collections.abc import Callable, Iterable, Sequence
 from io import BytesIO
 from math import ceil
@@ -62,6 +63,7 @@ from ..constants import (
     OutlineFontFlag,
     StreamAttributes,
 )
+from ..constants import FilterTypeAbbreviations as FTA
 from ..constants import FilterTypes as FT
 from ..constants import TypArguments as TA
 from ..constants import TypFitArguments as TF
@@ -1214,6 +1216,9 @@ class StreamObject(DictionaryObject):
         return img
 
 
+_RECOMPRESSION_PROBE_SIZE = 64 * 1024
+
+
 class DecodedStreamObject(StreamObject):
     pass
 
@@ -1225,6 +1230,33 @@ class EncodedStreamObject(StreamObject):
     def hash_value_data(self) -> bytes:
         # Use _data as decoding is slow, and it would keep a decoded copy in memory.
         return DictionaryObject.hash_value_data(self) + self._data
+
+    def _recompress_flate(self, level: int) -> None:
+        """
+        Replace an outermost Flate encoding by a smaller one with the same content.
+
+        Streams which do not decode cleanly stay as they are, as pypdf's lenient
+        decoding could lose data for them.
+        """
+        filters = self.get(StreamAttributes.FILTER)
+        outer_filter = filters[0] if isinstance(filters, ArrayObject) and filters else filters
+        if outer_filter not in (FT.FLATE_DECODE, FTA.FL):
+            return
+        limit = get_configuration().zlib_maximum_output_length
+        try:
+            # Skip the slow part if the beginning of a large stream shows no benefit.
+            if len(self._data) > 2 * _RECOMPRESSION_PROBE_SIZE:
+                beginning = zlib.decompressobj().decompress(self._data[:_RECOMPRESSION_PROBE_SIZE], max_length=limit)
+                if len(zlib.compress(beginning, level)) >= 0.99 * _RECOMPRESSION_PROBE_SIZE:
+                    return
+            decompressor = zlib.decompressobj()
+            data = decompressor.decompress(self._data, max_length=limit)
+        except zlib.error:
+            return
+        if decompressor.eof and not decompressor.unused_data.strip():
+            compressed = zlib.compress(data, level)
+            if len(compressed) < len(self._data):
+                self._data = compressed
 
     # This overrides the parent method
     def get_data(self) -> bytes:

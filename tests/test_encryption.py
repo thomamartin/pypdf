@@ -241,6 +241,21 @@ def test_make_crypt_filter_large_object_number(idnum, low_three_bytes):
     assert crypt_filter.stm_crypt.encrypt(b"hello world") == reference.stm_crypt.encrypt(b"hello world")
 
 
+def test_make_crypt_filter__shares_equal_ciphers():
+    reader = PdfReader(RESOURCE_ROOT / "encryption" / "r3-user-password.pdf", password="asdfzxcv")
+    encryption = reader._encryption
+
+    crypt_filter = encryption._make_crypt_filter(1, 0)
+    assert crypt_filter.str_crypt is crypt_filter.stm_crypt
+    assert crypt_filter.ef_crypt is crypt_filter.stm_crypt
+
+    encryption.StrF = "/Identity"
+    crypt_filter = encryption._make_crypt_filter(1, 0)
+    assert crypt_filter.str_crypt.encrypt(b"text") == b"text"
+    assert crypt_filter.stm_crypt.encrypt(b"text") != b"text"
+    assert crypt_filter.ef_crypt is crypt_filter.stm_crypt
+
+
 def test_attempt_decrypt_unencrypted_pdf():
     """Attempting to decrypt an unencrypted PDF raises a PdfReadError."""
     path = RESOURCE_ROOT / "crazyones.pdf"

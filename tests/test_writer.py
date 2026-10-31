@@ -4263,7 +4263,7 @@ def test_use_object_streams__many_objects():
 
     numbers = [reference.get_object()["/Number"] for reference in written.root_object["/TestObjects"]]
     assert numbers == list(range(1000))
-    assert len({number for number, _ in written.xref_objStm.values()}) == 11
+    assert len({number for number, _ in written.xref_objStm.values()}) == 3
 
 
 def test_use_object_streams__free_objects():

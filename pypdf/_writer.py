@@ -130,7 +130,7 @@ from .xmp import XmpInformation
 ALL_DOCUMENT_PERMISSIONS = UserAccessPermissions.all()
 
 _MAX_MERGE_ROUNDS = 8
-_OBJECTS_PER_OBJECT_STREAM = 100
+_OBJECTS_PER_OBJECT_STREAM = 500
 
 
 class ObjectDeletionFlag(enum.IntFlag):

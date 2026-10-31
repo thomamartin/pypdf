@@ -1908,7 +1908,10 @@ class PdfWriter(PdfDocCommon):
         """Map the object number of each image to the longest side of the largest page using it, in points."""
         sizes: dict[int, float] = {}
         for page in self.pages:
-            box = page.mediabox
+            try:
+                box = page.mediabox
+            except ValueError:
+                continue
             longest_side = float(max(box.width, box.height)) * float(page.user_unit)
             seen: set[int] = set()
             todo = [page.get("/Resources")]

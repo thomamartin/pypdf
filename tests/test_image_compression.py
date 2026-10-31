@@ -213,6 +213,14 @@ def test_compress_image__keeps_broken_jpeg():
     assert compress_image(stream, 9, 75, 1.0) is None
 
 
+def test_compress_image__keeps_huge_images_which_pillow_refuses():
+    stream = _stream(_photo())
+    stream[NameObject("/Filter")] = NameObject("/DCTDecode")
+    stream._data = _encoded(_photo(), "JPEG", quality=95)
+    with mock.patch("pypdf._image_compression.Image.open", side_effect=Image.DecompressionBombError):
+        assert compress_image(stream, 9, 50, 1.0) is None
+
+
 def test_compress_image__keeps_jpeg_which_does_not_match_the_dictionary():
     stream = _stream(_photo())
     stream[NameObject("/Filter")] = NameObject("/DCTDecode")
@@ -323,6 +331,15 @@ def test_compress__image_max_dpi_ignores_images_of_no_page():
     writer.compress(image_max_dpi=150)
 
     assert image.get_object()["/Width"] == 1000
+
+
+def test_compress__image_max_dpi_ignores_pages_without_a_valid_size():
+    writer, reference = _writer_with_image(_stream(_photo(1000, 500)))
+    writer.pages[0][NameObject("/MediaBox")] = ArrayObject([NumberObject(0)] * 2)
+
+    writer.compress(image_max_dpi=150)
+
+    assert reference.get_object()["/Width"] == 1000
 
 
 def test_compress__keeps_masks():

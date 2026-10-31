@@ -1,8 +1,9 @@
 """Lossless storage of images with few colors, for :meth:`PdfWriter.compress<pypdf.PdfWriter.compress>`."""
 
+import struct
 from io import BytesIO
 from itertools import islice
-from typing import Any, cast
+from typing import cast
 
 from .constants import ImageAttributes as IA
 from .constants import StreamAttributes as SA
@@ -25,6 +26,7 @@ _TIFF_FILL_ORDER = 266
 _TIFF_ROWS_PER_STRIP = 278
 _TIFF_STRIP_BYTE_COUNTS = 279
 _TIFF_STRIP_OFFSETS = 273
+_TIFF_TYPE_SHORT = 3
 _RGB_COLOR_SPACES = ("/DeviceRGB", "/CalRGB")
 
 
@@ -148,16 +150,25 @@ def use_palette(stream: EncodedStreamObject, level: int) -> bool:
 
 
 def _read_single_strip(tiff_file: BytesIO) -> bytes | None:
-    from PIL import Image  # noqa: PLC0415
+    """
+    Get the data of a TIFF file with one strip.
 
-    with Image.open(tiff_file) as tiff:
-        tags = cast(Any, tiff).tag_v2
-        offsets = tags[_TIFF_STRIP_OFFSETS]
-        sizes = tags[_TIFF_STRIP_BYTE_COUNTS]
-        fill_order = tags.get(_TIFF_FILL_ORDER, 1)
-    if len(offsets) != 1 or fill_order != 1:
+    This reads the tags directly, as Pillow refuses to open very large images.
+    """
+    tiff = tiff_file.getvalue()
+    if tiff[:4] != b"II*\x00":
         return None
-    return tiff_file.getvalue()[offsets[0]:offsets[0] + sizes[0]]
+    directory = struct.unpack_from("<I", tiff, 4)[0]
+    tags = {}
+    for index in range(struct.unpack_from("<H", tiff, directory)[0]):
+        tag, value_type, count = struct.unpack_from("<HHI", tiff, directory + 2 + 12 * index)
+        value_format = "<H" if value_type == _TIFF_TYPE_SHORT else "<I"
+        tags[tag] = (count, struct.unpack_from(value_format, tiff, directory + 10 + 12 * index)[0])
+    offset_count, offset = tags[_TIFF_STRIP_OFFSETS]
+    size = tags[_TIFF_STRIP_BYTE_COUNTS][1]
+    if offset_count != 1 or tags.get(_TIFF_FILL_ORDER, (1, 1))[1] != 1:
+        return None
+    return tiff[offset:offset + size]
 
 
 def _encode_group4(data: bytes, width: int, height: int) -> bytes | None:

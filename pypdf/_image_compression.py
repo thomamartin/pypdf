@@ -82,7 +82,7 @@ def _open_image(stream: StreamObject) -> tuple[Image.Image, bool] | None:
         try:
             image = Image.open(BytesIO(encoded))
             image.load()
-        except (OSError, ValueError, SyntaxError):
+        except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
             return None
         return (image, True) if image.mode == mode and image.size == (width, height) else None
 

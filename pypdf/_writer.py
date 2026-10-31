@@ -53,6 +53,7 @@ else:
 
 from ._doc_common import DocumentInformation, PdfDocCommon
 from ._encryption import EncryptAlgorithm, Encryption
+from ._font_compression import remove_unused_font_tables
 from ._jpeg_optimization import is_available as jpeg_optimization_is_available
 from ._jpeg_optimization import optimize_jpegs
 from ._page import PageObject, Transformation
@@ -83,6 +84,7 @@ from .constants import FieldDictionaryAttributes as FA
 from .constants import PageAttributes as PG
 from .constants import TrailerKeys as TK
 from .errors import LimitReachedError, PdfReadError, PyPdfError
+from .filters import FlateDecode
 from .generic import (
     PAGE_FIT,
     ArrayObject,
@@ -1823,6 +1825,7 @@ class PdfWriter(PdfDocCommon):
         self.compress_identical_objects(remove_duplicates=True, remove_unreferenced=True)
         if image_quality is not None or image_max_dpi is not None:
             self._compress_images(level, image_quality, image_max_dpi)
+        self._remove_unused_font_tables(level)
         try:
             xmp = self.xmp_metadata
             pdfa_part = None if xmp is None else xmp.pdfaid_part
@@ -1847,6 +1850,23 @@ class PdfWriter(PdfDocCommon):
         for stream, optimized in zip(streams, optimize_jpegs(jpegs)):
             if optimized is not None:
                 stream._replace_jpeg(optimized, level)
+
+    def _remove_unused_font_tables(self, level: int) -> None:
+        font_files: set[int] = set()
+        for obj in self._objects:
+            if isinstance(obj, DictionaryObject) and "/FontFile2" in obj:
+                font_file = obj.raw_get("/FontFile2")
+                if isinstance(font_file, IndirectObject):
+                    font_files.add(font_file.idnum)
+        for idnum in font_files:
+            font_file = self._objects[idnum - 1]
+            if not isinstance(font_file, EncodedStreamObject) or not font_file._is_only_flate_encoded():
+                continue
+            font = font_file._decode_flate_exactly()
+            reduced = None if font is None else remove_unused_font_tables(font)
+            if reduced is not None:
+                font_file._data = FlateDecode.encode(reduced, level)
+                font_file[NameObject("/Length1")] = NumberObject(len(reduced))
 
     def _compress_images(self, level: int, quality: int | None, max_dpi: int | None) -> None:
         from ._image_compression import compress_image  # noqa: PLC0415

@@ -20,6 +20,7 @@ from pypdf import (
     Transformation,
 )
 from pypdf._utils import get_stream_data
+from pypdf._writer import _MAX_MERGE_ROUNDS
 from pypdf.annotations import Link
 from pypdf.constants import FieldDictionaryAttributes
 from pypdf.errors import DeprecationError, LimitReachedError, PageSizeNotDefinedError, PdfReadError, PyPdfError
@@ -3081,6 +3082,37 @@ def test_compress_identical_objects__keeps_encryption():
 
     reader = PdfReader(output, password="password")
     assert reader.pages[0].extract_text().startswith("The Crazy Ones")
+
+
+def test_compress_identical_objects__merges_objects_using_merged_objects():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    users = []
+    for _ in range(2):
+        used = writer._add_object(DictionaryObject({NameObject("/Name"): NameObject("/Used")}))
+        users.append(writer._add_object(DictionaryObject({NameObject("/Uses"): used})))
+    writer.root_object[NameObject("/TestUsers")] = ArrayObject(users)
+
+    writer.compress_identical_objects()
+
+    kept = writer.root_object["/TestUsers"]
+    assert kept[0] == kept[1]
+    assert writer._objects[users[1].idnum - 1] is None
+
+
+def test_compress_identical_objects__limits_rounds():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    chains = []
+    for _ in range(2):
+        link = writer._add_object(DictionaryObject({NameObject("/Name"): NameObject("/End")}))
+        for _ in range(2 * _MAX_MERGE_ROUNDS):
+            link = writer._add_object(DictionaryObject({NameObject("/Next"): link}))
+        chains.append(link)
+    writer.root_object[NameObject("/TestChains")] = ArrayObject(chains)
+
+    with mock.patch.object(writer, "_merge_identical_objects", wraps=writer._merge_identical_objects) as merge:
+        writer.compress_identical_objects()
+
+    assert merge.call_count == _MAX_MERGE_ROUNDS
 
 
 def test_compress_identical_objects__keeps_annotations_separate():

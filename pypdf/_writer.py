@@ -122,6 +122,8 @@ from .xmp import XmpInformation
 
 ALL_DOCUMENT_PERMISSIONS = UserAccessPermissions.all()
 
+_MAX_MERGE_ROUNDS = 8
+
 
 class ObjectDeletionFlag(enum.IntFlag):
     NONE = 0
@@ -1656,6 +1658,21 @@ class PdfWriter(PdfDocCommon):
         if remove_orphans != self._UNSET:
             deprecation_with_replacement("remove_orphans", "remove_unreferenced", "7.0.0")
 
+        # Merging objects can make the objects which use them identical.
+        # Limit the rounds as a chain of such objects could be as long as the file.
+        for _ in range(_MAX_MERGE_ROUNDS):
+            if not self._merge_identical_objects(remove_duplicates):
+                break
+
+        if remove_unreferenced:
+            reachable = self._find_reachable_objects()
+            for idnum in range(1, len(self._objects) + 1):
+                if idnum not in reachable:
+                    self._objects[idnum - 1] = None
+
+    def _merge_identical_objects(self, remove_duplicates: bool) -> bool:
+        """Keep one of each group of identical objects, and tell if there were any others."""
+
         def replace_in_obj(
             obj: PdfObject, crossref: dict[IndirectObject, IndirectObject]
         ) -> None:
@@ -1703,11 +1720,7 @@ class PdfWriter(PdfDocCommon):
             if isinstance(obj, (DictionaryObject, ArrayObject)):
                 replace_in_obj(obj, cnv_rev)
 
-        if remove_unreferenced:
-            reachable = self._find_reachable_objects()
-            for idnum in range(1, len(self._objects) + 1):
-                if idnum not in reachable:
-                    self._objects[idnum - 1] = None
+        return len(cnv_rev) > 0
 
     def _find_reachable_objects(self) -> set[int]:
         """Get the numbers of all objects which the trailer leads to."""

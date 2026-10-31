@@ -1817,7 +1817,8 @@ class PdfWriter(PdfDocCommon):
             if obj.indirect_reference == document_metadata or (keep_all_metadata and obj.get("/Type") == "/Metadata"):
                 continue
             if isinstance(obj, EncodedStreamObject):
-                obj._recompress_flate(level)
+                if not obj._add_png_predictor(level):
+                    obj._recompress_flate(level)
             elif StreamAttributes.FILTER not in obj:
                 encoded = obj.flate_encode(level)
                 if len(encoded._data) + len(b"/Filter /FlateDecode\n") < len(obj.get_data()):

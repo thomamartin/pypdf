@@ -46,6 +46,7 @@ from pypdf.generic import (
     TextStringObject,
     TreeObject,
 )
+from pypdf.generic._data_structures import _apply_png_predictor
 from pypdf.generic._font import Font
 from pypdf.generic._viewerpref import BOX_NAMES
 from pypdf.xmp import XmpInformation
@@ -4566,3 +4567,130 @@ def test_recompress_flate__compresses_large_streams_with_benefit():
 
     assert len(stream._data) < len(data)
     assert zlib.decompress(stream._data) == b"".join(rows)
+
+
+def _naive_png_predictor(data: bytes, row_size: int, pixel_size: int, predictor: int) -> bytes:
+    output = bytearray()
+    previous = bytes(row_size)
+    for start in range(0, len(data), row_size):
+        row = data[start:start + row_size]
+        output.append(predictor)
+        for index, value in enumerate(row):
+            if predictor == 1:
+                other = row[index - pixel_size] if index >= pixel_size else 0
+            else:
+                other = previous[index]
+            output.append((value - other) & 0xFF)
+        previous = row
+    return bytes(output)
+
+
+@pytest.mark.parametrize("predictor", [1, 2])
+@pytest.mark.parametrize(("row_size", "pixel_size"), [(1, 1), (7, 1), (60, 3), (64, 4), (120, 6)])
+def test_apply_png_predictor(predictor, row_size, pixel_size):
+    data = os.urandom(row_size * 50) + bytes(row_size) + b"\xff" * row_size + bytes(row_size)
+    assert _apply_png_predictor(data, row_size, pixel_size, predictor) == _naive_png_predictor(
+        data, row_size, pixel_size, predictor
+    )
+
+
+def _image_stream(data: bytes, width: int, height: int, bits: int = 8) -> EncodedStreamObject:
+    stream = _encoded_stream(zlib.compress(data, 9))
+    stream[NameObject("/Subtype")] = NameObject("/Image")
+    stream[NameObject("/Width")] = NumberObject(width)
+    stream[NameObject("/Height")] = NumberObject(height)
+    stream[NameObject("/BitsPerComponent")] = NumberObject(bits)
+    return stream
+
+
+def _gradient(width: int, height: int, colors: int) -> bytes:
+    """A smooth image which compresses far better with a predictor."""
+    return bytes(
+        ((x * x + y * 7 + color * 11) // 16) & 0xFF
+        for y in range(height)
+        for x in range(width)
+        for color in range(colors)
+    )
+
+
+@pytest.mark.parametrize("colors", [1, 3, 4])
+def test_add_png_predictor(colors):
+    data = _gradient(300, 200, colors)
+    stream = _image_stream(data, 300, 200)
+    size_before = len(stream._data)
+
+    assert stream._add_png_predictor(9) is True
+
+    assert len(stream._data) < size_before
+    assert stream["/DecodeParms"] == {
+        "/BitsPerComponent": 8,
+        "/Colors": colors,
+        "/Columns": 300,
+        "/Predictor": 15,
+    }
+    assert stream.get_data() == data
+
+
+def test_add_png_predictor__sixteen_bits():
+    data = b"".join(bytes((y, x % 256)) * 3 for y in range(200) for x in range(300))
+    stream = _image_stream(data, 300, 200, bits=16)
+    assert stream._add_png_predictor(9) is True
+    assert stream["/DecodeParms"]["/Colors"] == 3
+    assert stream.get_data() == data
+
+
+def test_add_png_predictor__keeps_images_without_benefit():
+    data = os.urandom(300 * 200 * 3)
+    stream = _image_stream(data, 300, 200)
+    encoded = stream._data
+    assert stream._add_png_predictor(9) is False
+    assert stream._data == encoded
+    assert "/DecodeParms" not in stream
+
+
+def test_add_png_predictor__ignores_other_streams():
+    data = _gradient(300, 200, 3)
+
+    not_an_image = _image_stream(data, 300, 200)
+    del not_an_image["/Subtype"]
+    assert not_an_image._add_png_predictor(9) is False
+
+    with_parameters = _image_stream(data, 300, 200)
+    with_parameters[NameObject("/DecodeParms")] = DictionaryObject()
+    assert with_parameters._add_png_predictor(9) is False
+
+    other_filter = _image_stream(data, 300, 200)
+    other_filter[NameObject("/Filter")] = NameObject("/DCTDecode")
+    assert other_filter._add_png_predictor(9) is False
+
+    two_filters = _image_stream(data, 300, 200)
+    two_filters[NameObject("/Filter")] = ArrayObject([NameObject("/FlateDecode"), NameObject("/ASCII85Decode")])
+    assert two_filters._add_png_predictor(9) is False
+
+    wrong_size = _image_stream(data + b"more", 300, 200)
+    assert wrong_size._add_png_predictor(9) is False
+
+    no_width = _image_stream(data, 300, 200)
+    del no_width["/Width"]
+    assert no_width._add_png_predictor(9) is False
+
+    broken = _image_stream(data, 300, 200)
+    broken._data = broken._data[:-20]
+    assert broken._add_png_predictor(9) is False
+
+
+def test_compress__images_keep_their_pixels():
+    data = _gradient(300, 200, 3)
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    stream = _image_stream(data, 300, 200)
+    stream[NameObject("/ColorSpace")] = NameObject("/DeviceRGB")
+    writer.pages[0][NameObject("/Resources")][NameObject("/XObject")] = DictionaryObject(
+        {NameObject("/Test"): writer._add_object(stream)}
+    )
+    writer.compress()
+    output = BytesIO()
+    writer.write(output)
+
+    image = PdfReader(output).pages[0]["/Resources"]["/XObject"]["/Test"]
+    assert image["/DecodeParms"]["/Predictor"] == 15
+    assert image.get_data() == data

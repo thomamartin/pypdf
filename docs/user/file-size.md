@@ -80,8 +80,10 @@ It does the following:
   [Removing duplication](#removing-duplication).
 * It compresses streams again where that makes them smaller, and it uses PNG predictors
   for images where that helps. You can trade size for speed with
-  `writer.compress(level=6)`. With `pip install pypdf[deflate]`, it uses libdeflate, which
-  takes about as long but gives smaller files that all PDF readers can decode.
+  `writer.compress(level=6)`.
+* With `pip install pypdf[compress]`, it also uses libdeflate, which takes about as long
+  as zlib but gives smaller files, and it stores JPEG images in a smaller way that decodes
+  to the same pixels. All PDF readers can decode both.
 * It enables {attr}`writer.use_object_streams <pypdf.PdfWriter.use_object_streams>`,
   which stores most objects in compressed object streams.
 

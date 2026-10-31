@@ -53,6 +53,8 @@ else:
 
 from ._doc_common import DocumentInformation, PdfDocCommon
 from ._encryption import EncryptAlgorithm, Encryption
+from ._jpeg_optimization import is_available as jpeg_optimization_is_available
+from ._jpeg_optimization import optimize_jpegs
 from ._page import PageObject, Transformation
 from ._page_labels import nums_clear_range, nums_insert, nums_next
 from ._reader import PdfReader
@@ -1807,9 +1809,25 @@ class PdfWriter(PdfDocCommon):
             pdfa_part = None if xmp is None else xmp.pdfaid_part
         except PdfReadError:
             pdfa_part = None
+        self._optimize_jpegs(level)
         self._recompress_streams(level, keep_all_metadata=pdfa_part is not None)
         self._object_stream_level = level
         self.use_object_streams = str(pdfa_part) != "1"
+
+    def _optimize_jpegs(self, level: int) -> None:
+        if not jpeg_optimization_is_available():
+            return
+        streams = []
+        jpegs = []
+        for obj in self._objects:
+            if isinstance(obj, EncodedStreamObject):
+                jpeg = obj._get_jpeg()
+                if jpeg is not None:
+                    streams.append(obj)
+                    jpegs.append(jpeg)
+        for stream, optimized in zip(streams, optimize_jpegs(jpegs)):
+            if optimized is not None:
+                stream._replace_jpeg(optimized, level)
 
     def _recompress_streams(self, level: int, keep_all_metadata: bool) -> None:
         """Compress streams again where that saves space, without any lossy step."""

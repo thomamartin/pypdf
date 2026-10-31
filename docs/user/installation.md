@@ -49,10 +49,11 @@ pip install pypdf[image]
 ```
 
 If you want `writer.compress()` to produce smaller files, you need
-[`deflate`](https://pypi.org/project/deflate/):
+[`deflate`](https://pypi.org/project/deflate/) and
+[`mozjpeg-lossless-optimization`](https://pypi.org/project/mozjpeg-lossless-optimization/):
 
 ```
-pip install pypdf[deflate]
+pip install pypdf[compress]
 ```
 
 For JBIG2 support, you need to install a global OS-level package as well:

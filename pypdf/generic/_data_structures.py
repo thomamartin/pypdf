@@ -1296,6 +1296,27 @@ class EncodedStreamObject(StreamObject):
             if len(compressed) < len(self._data):
                 self._data = compressed
 
+    def _get_jpeg(self) -> bytes | None:
+        """Get the JPEG file of a stream, which may have an outer Flate encoding."""
+        filters = self.get(StreamAttributes.FILTER)
+        names = list(filters) if isinstance(filters, ArrayObject) else [filters]
+        jpeg_names = (FT.DCT_DECODE, FTA.DCT)
+        if len(names) == 1 and names[0] in jpeg_names:
+            return self._data
+        if len(names) == 2 and names[0] in (FT.FLATE_DECODE, FTA.FL) and names[1] in jpeg_names:
+            return self._decode_flate_exactly()
+        return None
+
+    def _replace_jpeg(self, jpeg: bytes, level: int) -> None:
+        """Store a new JPEG file for a stream if that makes it smaller."""
+        from ..filters import FlateDecode  # noqa: PLC0415
+
+        filters = self.get(StreamAttributes.FILTER)
+        if isinstance(filters, ArrayObject) and len(filters) == 2:
+            jpeg = FlateDecode.encode(jpeg, level)
+        if len(jpeg) < len(self._data):
+            self._data = jpeg
+
     def _add_png_predictor(self, level: int) -> bool:
         """
         Encode an image with a PNG predictor if that makes it smaller.

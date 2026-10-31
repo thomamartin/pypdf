@@ -42,7 +42,10 @@ Source = "https://github.com/py-pdf/pypdf"
 brotli = ["brotli>=1.2.0"]
 crypto = ["cryptography>=43"]
 cryptodome = ["pycryptodome"]
-deflate = ["deflate"]
+compress = [
+    "deflate",
+    "mozjpeg-lossless-optimization",
+]
 fonts = ["fonttools"]
 image = ["pillow>=8.0.0"]
 rtl_text = [
@@ -55,6 +58,7 @@ full = [
     "cryptography>=43",
     "deflate",
     "fonttools",
+    "mozjpeg-lossless-optimization",
     "pillow>=8.0.0",
     "python-bidi"
 ]

@@ -3223,6 +3223,7 @@ def test_utf16_metadata():
             "/Subject": "Invoice №AI_047",
         }
     )
+    writer.use_object_streams = False
     b = BytesIO()
     writer.write(b)
     b.seek(0)
@@ -4364,6 +4365,22 @@ def test_use_object_streams__encryption(algorithm):
     reader = PdfReader(output, password="password", strict=True)
     assert reader.metadata.title == "A secret title"
     assert reader.pages[0].extract_text() == expected_text
+
+
+@pytest.mark.parametrize(
+    ("name", "object_streams"),
+    [("crazyones.pdf", True), ("multilang.pdf", False)],
+)
+def test_use_object_streams__follows_the_cloned_document(name, object_streams):
+    reader = PdfReader(RESOURCE_ROOT / name)
+    assert (len(reader.xref_objStm) > 0) is object_streams
+
+    assert PdfWriter(clone_from=reader).use_object_streams is object_streams
+    assert PdfWriter().use_object_streams is False
+
+    writer = PdfWriter()
+    writer.append(reader)
+    assert writer.use_object_streams is False
 
 
 def test_compress():

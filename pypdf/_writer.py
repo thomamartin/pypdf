@@ -231,7 +231,7 @@ class PdfWriter(PdfDocCommon):
         If true, pypdf stores the objects in compressed object streams and writes a
         cross-reference stream instead of a cross-reference table. This needs at least
         PDF 1.5, so that a lower version in the header is raised, and it is not available
-        for incremental updates.
+        for incremental updates. Cloning a document which uses object streams enables it.
         """
 
         self._object_stream_level = 9
@@ -1198,6 +1198,7 @@ class PdfWriter(PdfDocCommon):
             self._objects.clear()
         self._root_object = reader.root_object.clone(self)
         self._pages = self._root_object.raw_get("/Pages")
+        self.use_object_streams = len(reader.xref_objStm) > 0
 
         trailer_size = cast(int, reader.trailer["/Size"])
         if len(self._objects) > trailer_size:

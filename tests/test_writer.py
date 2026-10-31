@@ -3055,6 +3055,34 @@ def test_compress_identical_objects__remove_unreferenced():
         writer.get_object(reference)
 
 
+def test_compress_identical_objects__removes_what_only_unreferenced_objects_use():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    last = writer._add_object(DictionaryObject({NameObject("/Name"): NameObject("/Last")}))
+    first = writer._add_object(DictionaryObject({NameObject("/Next"): last}))
+    circle = writer._add_object(DictionaryObject())
+    circle.get_object()[NameObject("/Next")] = writer._add_object(DictionaryObject({NameObject("/Next"): circle}))
+    objects_before = sum(obj is not None for obj in writer._objects)
+
+    writer.compress_identical_objects(remove_duplicates=False)
+
+    assert writer._objects[first.idnum - 1] is None
+    assert writer._objects[last.idnum - 1] is None
+    assert writer._objects[circle.idnum - 1] is None
+    assert sum(obj is not None for obj in writer._objects) == objects_before - 4
+    assert writer.pages[0].extract_text().startswith("The Crazy Ones")
+
+
+def test_compress_identical_objects__keeps_encryption():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    writer.encrypt("password", algorithm="RC4-40")
+    writer.compress_identical_objects()
+    output = BytesIO()
+    writer.write(output)
+
+    reader = PdfReader(output, password="password")
+    assert reader.pages[0].extract_text().startswith("The Crazy Ones")
+
+
 def test_compress_identical_objects__keeps_annotations_separate():
     writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
     annotations = [

@@ -55,6 +55,7 @@ from ._doc_common import DocumentInformation, PdfDocCommon
 from ._encryption import EncryptAlgorithm, Encryption
 from ._font_compression import remove_unused_font_tables
 from ._image_palette import use_group4, use_palette
+from ._image_placement import find_image_sizes
 from ._jpeg_optimization import is_available as jpeg_optimization_is_available
 from ._jpeg_optimization import optimize_jpegs
 from ._page import PageObject, Transformation
@@ -1812,9 +1813,10 @@ class PdfWriter(PdfDocCommon):
                 gives smaller files, and all PDF readers can decode its output.
             image_quality: Store images as JPEG with this quality, from 1 to 95,
                 if that makes them clearly smaller.
-            image_max_dpi: Reduce images which have more than this resolution even
-                if they fill the longest side of the page. An image which is
-                displayed smaller than the page keeps a higher resolution.
+            image_max_dpi: Reduce images which appear on a page with more than
+                this resolution. Images whose use cannot be determined exactly
+                count as if they filled the page, so they can keep a higher
+                resolution.
 
         """
         if self.incremental:
@@ -1877,14 +1879,20 @@ class PdfWriter(PdfDocCommon):
 
         masks = self._find_masks()
         page_sizes = self._find_page_sizes_of_images() if max_dpi is not None else {}
+        shown_sizes = self._find_shown_image_sizes() if max_dpi is not None else {}
         for index, obj in enumerate(self._objects):
             idnum = index + 1
             if not isinstance(obj, StreamObject) or obj.get("/Subtype") != "/Image":
                 continue
             scale = 1.0
-            if max_dpi is not None and idnum in page_sizes:
-                longest_side = max(cast(int, obj.get("/Width", 0)), cast(int, obj.get("/Height", 0)))
-                scale = min(1.0, max_dpi / (longest_side / (page_sizes[idnum] / 72))) if longest_side else 1.0
+            width, height = cast(int, obj.get("/Width", 0)), cast(int, obj.get("/Height", 0))
+            if max_dpi is not None and idnum in shown_sizes and width and height:
+                shown_width, shown_height = shown_sizes[idnum]
+                if shown_width and shown_height:
+                    dpi = min(width / (shown_width / 72), height / (shown_height / 72))
+                    scale = min(1.0, max_dpi / dpi)
+            elif max_dpi is not None and idnum in page_sizes and max(width, height):
+                scale = min(1.0, max_dpi / (max(width, height) / (page_sizes[idnum] / 72)))
             # A mask stays lossless, and /Matte needs the size of the image it belongs to.
             is_mask = idnum in masks
             if is_mask and "/Matte" in obj:
@@ -1892,6 +1900,16 @@ class PdfWriter(PdfDocCommon):
             compressed = compress_image(obj, level, None if is_mask else quality, scale)
             if compressed is not None:
                 self._objects[index] = compressed
+
+    def _find_shown_image_sizes(self) -> dict[int, tuple[float, float]]:
+        sizes = find_image_sizes(self.pages, self._objects)
+        # A mask has its own resolution, but it covers the same area as its image.
+        for idnum, size in list(sizes.items()):
+            image = self._objects[idnum - 1]
+            mask = image.raw_get("/SMask") if isinstance(image, StreamObject) and "/SMask" in image else None
+            if isinstance(mask, IndirectObject):
+                sizes[mask.idnum] = size
+        return sizes
 
     def _find_masks(self) -> set[int]:
         """Get the numbers of all objects which serve as a mask of an image."""

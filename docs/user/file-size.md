@@ -77,19 +77,24 @@ writer.write("out-compressed.pdf")
 It does the following:
 
 * It merges identical objects and removes unused ones, as described in
-  [Removing duplication](#removing-duplication).
-* It compresses streams again where that makes them smaller, and it uses PNG predictors
-  for images where that helps. You can trade size for speed with
-  `writer.compress(level=6)`.
-* With `pip install pypdf[compress]`, it also uses libdeflate, which takes about as long
-  as zlib but gives smaller files, and it stores JPEG images in a smaller way that decodes
-  to the same pixels. All PDF readers can decode both.
+  [Removing duplication](#removing-duplication), and it removes page thumbnails, which
+  PDF readers can create themselves.
+* It compresses streams again where that makes them smaller. You can trade size for
+  speed with `writer.compress(level=6)`.
+* It stores images in a better way without changing a single pixel: It uses PNG
+  predictors, an indexed color space for images with at most 256 colors, and CCITT
+  group 4 for images with 1 bit per pixel.
+* It removes the tables of TrueType fonts which have no effect in a PDF file.
 * It enables {attr}`writer.use_object_streams <pypdf.PdfWriter.use_object_streams>`,
   which stores most objects in compressed object streams.
 
-The output needs a PDF 1.5 reader, and images are not re-encoded. For PDF/A files,
-`compress()` follows the rules of the standard: Metadata stays uncompressed, and
-PDF/A-1 files do not get object streams. It is not available for incremental updates.
+CCITT group 4 needs Pillow. With `pip install pypdf[compress]`, it also uses libdeflate,
+which takes about as long as zlib but gives smaller files, and it stores JPEG images in a
+smaller way that decodes to the same pixels. All PDF readers can decode both.
+
+The output needs a PDF 1.5 reader. For PDF/A files, `compress()` follows the rules of the
+standard: Metadata stays uncompressed, and PDF/A-1 files do not get object streams. It is
+not available for incremental updates.
 
 To save more, you can give up image quality:
 
@@ -99,10 +104,10 @@ writer.compress(image_quality=75, image_max_dpi=150)
 writer.write("out-compressed-images.pdf")
 ```
 
-`image_quality` stores images as JPEG, and `image_max_dpi` reduces images which have more
-than that resolution even if they fill the page. Both need Pillow, and both change the
-images, so please check the result: JPEG is fine for photos, but it can visibly change
-charts and scanned text, and it alters images which carry measured data.
+`image_quality` stores images as JPEG, and `image_max_dpi` reduces images which appear on
+a page with more than that resolution. Both need Pillow, and both change the images, so
+please check the result: JPEG is fine for photos, but it can visibly change scanned text,
+and it alters images which carry measured data. Images with few colors stay lossless.
 
 pypdf supports the FlateDecode filter which uses the zlib/deflate compression
 method. It is a lossless compression, meaning the resulting PDF looks exactly

@@ -206,6 +206,12 @@ def test_compress_image__keeps_data_of_unexpected_size():
     assert compress_image(stream, 9, 75, 1.0) is None
 
 
+def test_compress_image__keeps_streams_which_do_not_decode():
+    stream = _stream(_photo())
+    stream[NameObject("/Filter")] = NameObject("/FlateD@ecode")
+    assert compress_image(stream, 9, 75, 1.0) is None
+
+
 def test_compress_image__keeps_broken_jpeg():
     stream = _stream(_photo())
     stream[NameObject("/Filter")] = NameObject("/DCTDecode")

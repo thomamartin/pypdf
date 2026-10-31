@@ -5,6 +5,9 @@ Please note that broken PDF files might cause other Exceptions.
 """
 
 
+import zlib
+
+
 class DeprecationError(Exception):
     """Raised when a deprecated feature is used."""
 
@@ -72,3 +75,7 @@ class LimitReachedError(PyPdfError):
 
 class XmpDocumentError(PyPdfError, RuntimeError):
     """Raised when the XMP XML document context is invalid or missing."""
+
+
+# What can go wrong when decoding a stream of a damaged file.
+DECODING_ERRORS = (PyPdfError, NotImplementedError, ValueError, OSError, KeyError, TypeError, zlib.error)

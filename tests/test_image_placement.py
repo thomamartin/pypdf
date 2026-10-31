@@ -1,14 +1,16 @@
 """Test finding out how large images appear on their pages."""
 
+import time
 
 import pytest
 
 from pypdf import PdfWriter
-from pypdf._image_placement import _read_operators, find_image_sizes
+from pypdf._image_placement import _PlacementError, _read_operators, find_image_sizes
 from pypdf.generic import (
     ArrayObject,
     DecodedStreamObject,
     DictionaryObject,
+    EncodedStreamObject,
     FloatObject,
     IndirectObject,
     NameObject,
@@ -79,6 +81,25 @@ def test_read_operators():
 )
 def test_read_operators__ignores_other_tokens(data):
     assert _read_operators(data) == []
+
+
+def test_read_operators__unfinished_string():
+    with pytest.raises(_PlacementError):
+        _read_operators(b"(This string does not end q")
+
+
+def test_read_operators__strings_nested_too_deeply():
+    with pytest.raises(_PlacementError):
+        _read_operators(b"(a(b(c(d)c)b)a)")
+
+
+def test_read_operators__nested_strings():
+    assert _read_operators(b"(a(b(c)b)a) Tj q") == [("q", None)]
+
+
+def test_read_operators__unfinished_inline_image():
+    with pytest.raises(_PlacementError):
+        _read_operators(b"BI /W 1 /H 1 ID q")
 
 
 def test_read_operators__numbers():
@@ -265,3 +286,54 @@ def test_compress__image_max_dpi_ignores_images_shown_without_a_size():
     writer.compress(image_max_dpi=150)
 
     assert image.get_object()["/Width"] == 1000
+
+
+@pytest.mark.parametrize(
+    ("pattern", "tail"),
+    [
+        pytest.param(b"(", b"", id="only opening parentheses"),
+        pytest.param(b"(a", b"", id="unclosed strings"),
+        pytest.param(b"(()", b"", id="unclosed nested strings"),
+        pytest.param(b"()(", b"", id="pairs and unclosed strings"),
+        pytest.param(b"\\(", b"", id="escapes"),
+        pytest.param(b"(\\", b"", id="unclosed escapes"),
+        pytest.param(b"<", b"", id="unclosed hexadecimal strings"),
+        pytest.param(b"<0", b"", id="unclosed hexadecimal data"),
+        pytest.param(b"BI ", b"", id="inline images without data"),
+        pytest.param(b"BI ID ", b"", id="inline images without end"),
+        pytest.param(b" ID ", b"BI ", id="many data markers"),
+        pytest.param(b"1 ", b"", id="numbers without operator"),
+        pytest.param(b"1 2 3 4 5 6 ", b"", id="matrices without operator"),
+        pytest.param(b"1234567890123456789012345678901234567890 ", b"", id="long numbers without operator"),
+        pytest.param(b"12345678901234567890.1234567890 ", b"", id="long decimals without operator"),
+        pytest.param(b".", b"", id="dots"),
+        pytest.param(b"/a ", b"", id="names without operator"),
+        pytest.param(b"%", b"", id="comments"),
+    ],
+)
+def test_read_operators__takes_linear_time(pattern, tail):
+    """Damaged content streams must not make the regular expression slow."""
+
+    def duration(size: int) -> float:
+        data = tail + pattern * (size // len(pattern))
+        start = time.perf_counter()
+        try:
+            _read_operators(data)
+        except _PlacementError:
+            pass
+        return time.perf_counter() - start
+
+    assert duration(1_500_000) < 2
+
+
+def test_find_image_sizes__contents_which_do_not_decode():
+    writer = PdfWriter()
+    image = _image(writer)
+    _page(writer, b"10 0 0 10 0 0 cm /Image Do", {"/Image": image})
+    contents = writer.pages[0]["/Contents"].get_object()
+    broken = EncodedStreamObject()
+    broken[NameObject("/Filter")] = NameObject("/FlateD@ecode")
+    broken._data = contents.get_data()
+    writer._objects[writer.pages[0].raw_get("/Contents").idnum - 1] = broken
+
+    assert image.idnum not in _sizes(writer)

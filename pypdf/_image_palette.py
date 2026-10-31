@@ -7,6 +7,7 @@ from typing import cast
 
 from .constants import ImageAttributes as IA
 from .constants import StreamAttributes as SA
+from .errors import DECODING_ERRORS
 from .filters import FlateDecode
 from .generic import (
     ArrayObject,
@@ -118,9 +119,14 @@ def use_palette(stream: EncodedStreamObject, level: int) -> bool:
     ):
         return False
     decoded = stream._decode_flate_exactly()
-    if decoded is None or _has_too_many_colors_at_the_start(stream, decoded, width):
+    if decoded is None:
         return False
-    data = stream.get_data()
+    try:
+        if _has_too_many_colors_at_the_start(stream, decoded, width):
+            return False
+        data = stream.get_data()
+    except DECODING_ERRORS:
+        return False
     if len(data) != width * height * 3:
         return False
     colors = _find_colors(data)

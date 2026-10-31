@@ -347,3 +347,10 @@ def test_use_group4__pillow_cannot_write_the_file():
     stream = _bilevel_stream(_scan(600, 500), 600, 500)
     with mock.patch("PIL.Image.Image.save", side_effect=OSError("encoder error -2")):
         assert use_group4(stream) is False
+
+
+def test_use_palette__keeps_images_with_broken_predictors():
+    stream = _stream(_pixels(200, 100, 4), 200, 100)
+    stream[NameObject("/DecodeParms")] = _predictor_parameters(200, 15)
+    stream["/DecodeParms"][NameObject("/Colors")] = NumberObject(0)
+    assert use_palette(stream, 9) is False

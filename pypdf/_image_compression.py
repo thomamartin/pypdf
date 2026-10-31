@@ -14,6 +14,7 @@ from .constants import FilterTypeAbbreviations as FTA
 from .constants import FilterTypes as FT
 from .constants import ImageAttributes as IA
 from .constants import StreamAttributes as SA
+from .errors import DECODING_ERRORS
 from .filters import FlateDecode
 from .generic import ArrayObject, DictionaryObject, EncodedStreamObject, NameObject, NumberObject, StreamObject
 
@@ -89,7 +90,10 @@ def _open_image(stream: StreamObject) -> tuple[Image.Image, bool] | None:
     if stream.get(IA.BITS_PER_COMPONENT) != 8:
         return None
     size = (cast(int, width), cast(int, height))
-    data = stream.get_data()
+    try:
+        data = stream.get_data()
+    except DECODING_ERRORS:
+        return None
     if len(data) != size[0] * size[1] * components:
         return None
     return Image.frombytes(mode, size, data), False

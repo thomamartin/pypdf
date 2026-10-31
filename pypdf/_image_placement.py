@@ -11,6 +11,7 @@ import math
 import re
 from typing import Any
 
+from .errors import DECODING_ERRORS
 from .generic import ArrayObject, DictionaryObject, IndirectObject, StreamObject
 
 Matrix = tuple[float, float, float, float, float, float]
@@ -18,18 +19,21 @@ Matrix = tuple[float, float, float, float, float, float]
 _IDENTITY: Matrix = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
 _MAXIMUM_FORM_DEPTH = 8
 _MAXIMUM_FORM_CALLS = 100_000
-_NUMBER = rb"[-+]?(?:\d+\.?\d*|\.\d+)"
-_INLINE_IMAGE = re.compile(rb"(?<![^\s])BI\s.*?\sID\s.*?\sEI(?=\s|$)", re.DOTALL)
+_NUMBER = rb"[-+]?(?:\d+(?:\.\d*)?|\.\d+)"
+# Unrolled loops: Each byte has only one way to match, so that failing takes linear time.
+_STRING_LEVEL_1 = rb"\([^()\\]*(?:\\.[^()\\]*)*\)"
+_STRING_LEVEL_2 = rb"\([^()\\]*(?:(?:\\.|" + _STRING_LEVEL_1 + rb")[^()\\]*)*\)"
+_STRING = rb"\([^()\\]*(?:(?:\\.|" + _STRING_LEVEL_2 + rb")[^()\\]*)*\)"
+_INLINE_IMAGE_MARK = re.compile(rb"(?<![^\s])(BI|ID|EI)(?=\s|$)")
 _TOKEN = re.compile(
-    rb"\((?:[^()\\]|\\.|\((?:[^()\\]|\\.|\((?:[^()\\]|\\.)*\))*\))*\)"  # literal string
-    rb"|<[0-9A-Fa-f\s]*>"  # hexadecimal string
+    _STRING + rb"|<[0-9A-Fa-f\s]{0,1048576}>"  # hexadecimal string
     rb"|%[^\r\n]*"  # comment
     rb"|(?<![^\s\]>)])(q|Q)(?=[\s/\[(<]|$)"
     rb"|(?<![^\s\]>)])(" + rb"\s+".join([_NUMBER] * 6) + rb")\s+cm(?=[\s/\[(<]|$)"
-    rb"|/([^\s/\[\]()<>{}%]+)\s+Do(?=[\s/\[(<]|$)",
+    rb"|/([^\s/\[\]()<>{}%]+)\s+Do(?=[\s/\[(<]|$)"
+    rb"|(\()",  # an opening parenthesis which starts no valid string
     re.DOTALL,
 )
-
 
 class _PlacementError(Exception):
     """The operators of a content stream do not make sense."""
@@ -48,13 +52,38 @@ def _multiply(first: Matrix, second: Matrix) -> Matrix:
     )
 
 
+def _remove_inline_images(data: bytes) -> bytes:
+    """Remove inline images, whose binary data could look like operators."""
+    parts = []
+    position = 0
+    start = -1
+    has_data = False
+    for match in _INLINE_IMAGE_MARK.finditer(data):
+        mark = match.group(1)
+        if mark == b"BI" and start < 0:
+            start = match.start()
+        elif mark == b"ID" and start >= 0:
+            has_data = True
+        elif mark == b"EI" and has_data:
+            parts.append(data[position:start])
+            position = match.end()
+            start = -1
+            has_data = False
+    if start >= 0:
+        raise _PlacementError
+    parts.append(data[position:])
+    return b" ".join(parts)
+
+
 def _read_operators(data: bytes) -> list[tuple[str, Any]]:
     """Get the operators which matter for the position of images."""
-    if b"ID" in data:
-        data = _INLINE_IMAGE.sub(b" ", data)
+    if b"BI" in data:
+        data = _remove_inline_images(data)
     operators: list[tuple[str, Any]] = []
     for match in _TOKEN.finditer(data):
-        stack_operator, matrix, name = match.groups()
+        stack_operator, matrix, name, broken_string = match.groups()
+        if broken_string is not None:
+            raise _PlacementError  # Going on would search the rest of the stream again for each string.
         if stack_operator is not None:
             operators.append((stack_operator.decode(), None))
         elif matrix is not None:
@@ -162,7 +191,7 @@ def find_image_sizes(pages: Any, objects: list[Any]) -> dict[int, tuple[float, f
             contents = page.get("/Contents")
             operators = _read_operators(_get_data(contents)) if contents is not None else []
             finder.walk(operators, resources, _IDENTITY, 0)
-        except (_PlacementError, ValueError, OSError):
+        except (_PlacementError, *DECODING_ERRORS):
             not_understood.update(
                 idnum for idnum, size in finder.sizes.items() if before.get(idnum) != size
             )

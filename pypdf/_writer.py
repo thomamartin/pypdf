@@ -1687,7 +1687,9 @@ class PdfWriter(PdfDocCommon):
             assert obj is not None, "mypy"  # mypy: TypeGuard of `is_null_or_none` does not help here.
             assert isinstance(obj.indirect_reference, IndirectObject)
             h = obj.hash_value()
-            if remove_duplicates and h in self._idnum_hash:
+            # An annotation may only be used once, see §12.5.2 of the PDF 2.0 specification.
+            is_annotation = isinstance(obj, DictionaryObject) and "/Rect" in obj and "/Subtype" in obj
+            if remove_duplicates and h in self._idnum_hash and not is_annotation:
                 self._idnum_hash[h][1].append(obj.indirect_reference)
                 self._objects[idx] = None
             else:

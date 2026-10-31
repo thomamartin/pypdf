@@ -3055,6 +3055,38 @@ def test_compress_identical_objects__remove_unreferenced():
         writer.get_object(reference)
 
 
+def test_compress_identical_objects__keeps_annotations_separate():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    annotations = [
+        writer._add_object(
+            DictionaryObject(
+                {
+                    NameObject("/Subtype"): NameObject("/Square"),
+                    NameObject("/Rect"): ArrayObject([NumberObject(0)] * 4),
+                }
+            )
+        )
+        for _ in range(2)
+    ]
+    writer.pages[0][NameObject("/Annots")] = ArrayObject(annotations)
+
+    writer.compress_identical_objects()
+
+    assert list(writer.pages[0]["/Annots"]) == annotations
+    assert all(annotation.get_object() is not None for annotation in annotations)
+
+
+def test_compress_identical_objects__merges_numbers():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    numbers = [writer._add_object(NumberObject(42)) for _ in range(2)]
+    writer.root_object[NameObject("/TestNumbers")] = ArrayObject(numbers)
+
+    writer.compress_identical_objects()
+
+    kept = writer.root_object["/TestNumbers"]
+    assert kept[0] == kept[1]
+
+
 def test_compress_identical_objects__does_not_decode_streams():
     writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
     streams = []

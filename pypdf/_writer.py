@@ -1781,7 +1781,9 @@ class PdfWriter(PdfDocCommon):
                 if idnum not in reachable:
                     self._objects[idnum - 1] = None
 
-    def compress(self, level: int = 10) -> None:
+    def compress(
+        self, level: int = 10, *, image_quality: int | None = None, image_max_dpi: int | None = None
+    ) -> None:
         """
         Make the file as small as possible without changing its content.
 
@@ -1793,17 +1795,34 @@ class PdfWriter(PdfDocCommon):
         The output needs PDF 1.5. For PDF/A files, no metadata stream gets compressed,
         and PDF/A-1 files do not get object streams as that part forbids them.
 
+        By default, this keeps every pixel. The two image parameters give up image
+        quality, and no check can tell if that is acceptable for your images: JPEG
+        is fine for photos, but it changes charts, scans of text and images which
+        carry data. They need Pillow. Images with few colors stay lossless, and
+        so do masks and images with unusual color spaces.
+
         Args:
             level: The compression level for the streams, from 1 (fastest) to
                 12 (smallest). Levels above 9 need the ``deflate`` package,
                 otherwise they mean level 9. It takes about as long as zlib but
                 gives smaller files, and all PDF readers can decode its output.
+            image_quality: Store images as JPEG with this quality, from 1 to 95,
+                if that makes them clearly smaller.
+            image_max_dpi: Reduce images which have more than this resolution even
+                if they fill the longest side of the page. An image which is
+                displayed smaller than the page keeps a higher resolution.
 
         """
         if self.incremental:
             raise NotImplementedError("Compressing incremental updates is not supported.")
+        if image_quality is not None and not 1 <= image_quality <= 95:
+            raise ValueError(f"image_quality must be between 1 and 95, got {image_quality}.")
+        if image_max_dpi is not None and image_max_dpi <= 0:
+            raise ValueError(f"image_max_dpi must be positive, got {image_max_dpi}.")
 
         self.compress_identical_objects(remove_duplicates=True, remove_unreferenced=True)
+        if image_quality is not None or image_max_dpi is not None:
+            self._compress_images(level, image_quality, image_max_dpi)
         try:
             xmp = self.xmp_metadata
             pdfa_part = None if xmp is None else xmp.pdfaid_part
@@ -1828,6 +1847,65 @@ class PdfWriter(PdfDocCommon):
         for stream, optimized in zip(streams, optimize_jpegs(jpegs)):
             if optimized is not None:
                 stream._replace_jpeg(optimized, level)
+
+    def _compress_images(self, level: int, quality: int | None, max_dpi: int | None) -> None:
+        from ._image_compression import compress_image  # noqa: PLC0415
+
+        masks = self._find_masks()
+        page_sizes = self._find_page_sizes_of_images() if max_dpi is not None else {}
+        for index, obj in enumerate(self._objects):
+            idnum = index + 1
+            if not isinstance(obj, StreamObject) or obj.get("/Subtype") != "/Image":
+                continue
+            scale = 1.0
+            if max_dpi is not None and idnum in page_sizes:
+                longest_side = max(cast(int, obj.get("/Width", 0)), cast(int, obj.get("/Height", 0)))
+                scale = min(1.0, max_dpi / (longest_side / (page_sizes[idnum] / 72))) if longest_side else 1.0
+            # A mask stays lossless, and /Matte needs the size of the image it belongs to.
+            is_mask = idnum in masks
+            if is_mask and "/Matte" in obj:
+                continue
+            compressed = compress_image(obj, level, None if is_mask else quality, scale)
+            if compressed is not None:
+                self._objects[index] = compressed
+
+    def _find_masks(self) -> set[int]:
+        """Get the numbers of all objects which serve as a mask of an image."""
+        masks: set[int] = set()
+        for obj in self._objects:
+            if isinstance(obj, StreamObject):
+                for key in ("/SMask", "/Mask"):
+                    value = obj.raw_get(key) if key in obj else None
+                    if isinstance(value, IndirectObject):
+                        masks.add(value.idnum)
+        return masks
+
+    def _find_page_sizes_of_images(self) -> dict[int, float]:
+        """Map the object number of each image to the longest side of the largest page using it, in points."""
+        sizes: dict[int, float] = {}
+        for page in self.pages:
+            box = page.mediabox
+            longest_side = float(max(box.width, box.height)) * float(page.user_unit)
+            seen: set[int] = set()
+            todo = [page.get("/Resources")]
+            while todo:
+                resources = todo.pop()
+                xobjects = resources.get("/XObject") if isinstance(resources, DictionaryObject) else None
+                if not isinstance(xobjects, DictionaryObject):
+                    continue
+                for reference in xobjects.values():
+                    xobject = reference.get_object() if isinstance(reference, IndirectObject) else None
+                    if not isinstance(xobject, StreamObject) or reference.idnum in seen:
+                        continue
+                    seen.add(reference.idnum)
+                    if xobject.get("/Subtype") == "/Image":
+                        sizes[reference.idnum] = max(sizes.get(reference.idnum, 0.0), longest_side)
+                        mask = xobject.raw_get("/SMask") if "/SMask" in xobject else None
+                        if isinstance(mask, IndirectObject):
+                            sizes[mask.idnum] = max(sizes.get(mask.idnum, 0.0), longest_side)
+                    elif xobject.get("/Subtype") == "/Form":
+                        todo.append(xobject.get("/Resources"))
+        return sizes
 
     def _recompress_streams(self, level: int, keep_all_metadata: bool) -> None:
         """Compress streams again where that saves space, without any lossy step."""

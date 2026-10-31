@@ -91,6 +91,19 @@ The output needs a PDF 1.5 reader, and images are not re-encoded. For PDF/A file
 `compress()` follows the rules of the standard: Metadata stays uncompressed, and
 PDF/A-1 files do not get object streams. It is not available for incremental updates.
 
+To save more, you can give up image quality:
+
+```{testcode}
+writer = PdfWriter(clone_from="example.pdf")
+writer.compress(image_quality=75, image_max_dpi=150)
+writer.write("out-compressed-images.pdf")
+```
+
+`image_quality` stores images as JPEG, and `image_max_dpi` reduces images which have more
+than that resolution even if they fill the page. Both need Pillow, and both change the
+images, so please check the result: JPEG is fine for photos, but it can visibly change
+charts and scanned text, and it alters images which carry measured data.
+
 pypdf supports the FlateDecode filter which uses the zlib/deflate compression
 method. It is a lossless compression, meaning the resulting PDF looks exactly
 the same.

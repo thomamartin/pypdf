@@ -2002,6 +2002,8 @@ class PdfWriter(PdfDocCommon):
         for obj in self._objects:
             if isinstance(obj, (DictionaryObject, ArrayObject)):
                 replace_in_obj(obj, cnv_rev)
+        if self._info_obj in cnv_rev:
+            self._info_obj = cnv_rev[cast(IndirectObject, self._info_obj)]
 
         return len(cnv_rev) > 0
 

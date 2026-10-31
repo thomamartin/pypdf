@@ -45,6 +45,7 @@ from pypdf.generic import (
     StreamObject,
     TextStringObject,
     TreeObject,
+    create_string_object,
 )
 from pypdf.generic._data_structures import _apply_png_predictor
 from pypdf.generic._font import Font
@@ -3151,6 +3152,22 @@ def test_compress_identical_objects__merges_numbers():
 
     kept = writer.root_object["/TestNumbers"]
     assert kept[0] == kept[1]
+
+
+def test_compress_identical_objects__keeps_merged_metadata():
+    writer = PdfWriter()
+    writer.add_blank_page(width=100, height=100)
+    info = {NameObject("/Title"): create_string_object("Merged with a twin")}
+    twin = writer._add_object(DictionaryObject(info))
+    writer.root_object[NameObject("/TestTwin")] = twin
+    writer._info_obj = writer._add_object(DictionaryObject(info))
+
+    writer.compress_identical_objects()
+
+    assert writer.metadata.title == "Merged with a twin"
+    output = BytesIO()
+    writer.write(output)
+    assert PdfReader(output).metadata.title == "Merged with a twin"
 
 
 def test_compress_identical_objects__does_not_decode_streams():

@@ -35,7 +35,6 @@ import struct
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from io import BytesIO, FileIO, IOBase
-from itertools import compress
 from pathlib import Path
 from re import Pattern
 from types import TracebackType
@@ -54,6 +53,11 @@ else:
 
 from ._doc_common import DocumentInformation, PdfDocCommon
 from ._encryption import EncryptAlgorithm, Encryption
+from ._font_compression import remove_unused_font_tables
+from ._image_palette import use_group4, use_palette
+from ._image_placement import find_image_sizes
+from ._jpeg_optimization import is_available as jpeg_optimization_is_available
+from ._jpeg_optimization import optimize_jpegs
 from ._page import PageObject, Transformation
 from ._page_labels import nums_clear_range, nums_insert, nums_next
 from ._reader import PdfReader
@@ -75,21 +79,25 @@ from .constants import (
     OutlineFontFlag,
     PageLabelStyle,
     PagesAttributes,
+    StreamAttributes,
     UserAccessPermissions,
 )
 from .constants import FieldDictionaryAttributes as FA
 from .constants import PageAttributes as PG
 from .constants import TrailerKeys as TK
 from .errors import LimitReachedError, PdfReadError, PyPdfError
+from .filters import FlateDecode
 from .generic import (
     PAGE_FIT,
     ArrayObject,
     BooleanObject,
     ByteStringObject,
     ContentStream,
+    DecodedStreamObject,
     Destination,
     DictionaryObject,
     EmbeddedFile,
+    EncodedStreamObject,
     Fit,
     FloatObject,
     IndirectObject,
@@ -122,6 +130,9 @@ from .types import (
 from .xmp import XmpInformation
 
 ALL_DOCUMENT_PERMISSIONS = UserAccessPermissions.all()
+
+_MAX_MERGE_ROUNDS = 8
+_OBJECTS_PER_OBJECT_STREAM = 500
 
 
 class ObjectDeletionFlag(enum.IntFlag):
@@ -214,6 +225,16 @@ class PdfWriter(PdfDocCommon):
         """
 
         self.incremental = incremental or full
+
+        self.use_object_streams = False
+        """
+        If true, pypdf stores the objects in compressed object streams and writes a
+        cross-reference stream instead of a cross-reference table. This needs at least
+        PDF 1.5, so that a lower version in the header is raised, and it is not available
+        for incremental updates. Cloning a document which uses object streams enables it.
+        """
+
+        self._object_stream_level = 9
 
         self._objects = []
 
@@ -1177,6 +1198,7 @@ class PdfWriter(PdfDocCommon):
             self._objects.clear()
         self._root_object = reader.root_object.clone(self)
         self._pages = self._root_object.raw_get("/Pages")
+        self.use_object_streams = len(reader.xref_objStm) > 0
 
         trailer_size = cast(int, reader.trailer["/Size"])
         if len(self._objects) > trailer_size:
@@ -1386,6 +1408,8 @@ class PdfWriter(PdfDocCommon):
             stream.write(self._reader.stream.read(-1))
             if has_increment:
                 self._write_increment(stream)  # writes objs, xref stream and startxref
+        elif self.use_object_streams:
+            self._write_with_object_streams(stream)
         else:
             object_positions, free_objects = self._write_pdf_structure(stream)
             xref_location = self._write_xref_table(
@@ -1531,16 +1555,106 @@ class PdfWriter(PdfDocCommon):
         for idnum, obj in enumerate(self._objects, start=1):
             if obj is not None:
                 object_positions.append(stream.tell())
-                stream.write(f"{idnum} 0 obj\n".encode())
-                if self._encryption and obj != self._encrypt_entry:
-                    obj = self._encryption.encrypt_object(obj, idnum, 0)
-                obj.write_to_stream(stream)
-                stream.write(b"\nendobj\n")
+                self._write_indirect_object(stream, idnum, obj)
             else:
                 object_positions.append(-1)
                 free_objects.append(idnum)
         free_objects.append(0)  # add 0 to loop in accordance with specification
         return object_positions, free_objects
+
+    def _write_indirect_object(self, stream: StreamType, idnum: int, obj: PdfObject) -> None:
+        stream.write(f"{idnum} 0 obj\n".encode())
+        if self._encryption and obj != self._encrypt_entry:
+            obj = self._encryption.encrypt_object(obj, idnum, 0)
+        obj.write_to_stream(stream)
+        stream.write(b"\nendobj\n")
+
+    def _write_with_object_streams(self, stream: StreamType) -> None:
+        """See §7.5.7 and §7.5.8 of the PDF 1.7 or PDF 2.0 specification."""
+        stream.write(_get_max_pdf_version_header(self.pdf_header, "%PDF-1.5").encode() + b"\n")
+        stream.write(b"%\xE2\xE3\xCF\xD3\n")
+
+        # Maps object numbers to the three fields of a cross-reference stream entry.
+        entries: dict[int, tuple[int, int, int]] = {}
+        compressible = []
+        for idnum, obj in enumerate(self._objects, start=1):
+            if obj is None:
+                continue
+            if self._can_be_in_object_stream(obj):
+                compressible.append((idnum, obj))
+            else:
+                entries[idnum] = (1, stream.tell(), 0)
+                self._write_indirect_object(stream, idnum, obj)
+
+        next_idnum = len(self._objects) + 1
+        for start in range(0, len(compressible), _OBJECTS_PER_OBJECT_STREAM):
+            objects = compressible[start:start + _OBJECTS_PER_OBJECT_STREAM]
+            entries.update(
+                (idnum, (2, next_idnum, index)) for index, (idnum, _) in enumerate(objects)
+            )
+            entries[next_idnum] = (1, stream.tell(), 0)
+            self._write_indirect_object(stream, next_idnum, self._create_object_stream(objects))
+            next_idnum += 1
+
+        entries[next_idnum] = (1, stream.tell(), 0)
+        free_objects = [idnum for idnum in range(1, next_idnum) if idnum not in entries]
+        for idnum, next_free in zip([0, *free_objects], [*free_objects, 0]):
+            entries[idnum] = (0, next_free, 1 if idnum else 65535)
+
+        xref_location = stream.tell()
+        stream.write(f"{next_idnum} 0 obj\n".encode())
+        self._create_cross_reference_stream(entries).write_to_stream(stream)
+        stream.write(f"\nendobj\nstartxref\n{xref_location}\n%%EOF\n".encode())
+
+    def _can_be_in_object_stream(self, obj: PdfObject) -> bool:
+        if isinstance(obj, StreamObject) or obj is self._encrypt_entry:
+            return False
+        # Signing tools replace the placeholders of a signature within the file.
+        return not (isinstance(obj, DictionaryObject) and "/ByteRange" in obj)
+
+    def _create_object_stream(self, objects: list[tuple[int, PdfObject]]) -> StreamObject:
+        offsets = []
+        data = BytesIO()
+        for idnum, obj in objects:
+            offsets.append(f"{idnum} {data.tell()}")
+            obj.write_to_stream(data)
+            data.write(b"\n")
+        header = " ".join(offsets).encode() + b"\n"
+
+        object_stream = DecodedStreamObject()
+        object_stream[NameObject("/Type")] = NameObject("/ObjStm")
+        object_stream[NameObject("/N")] = NumberObject(len(objects))
+        object_stream[NameObject("/First")] = NumberObject(len(header))
+        object_stream.set_data(header + data.getvalue())
+        return object_stream.flate_encode(level=self._object_stream_level)
+
+    def _create_cross_reference_stream(self, entries: dict[int, tuple[int, int, int]]) -> StreamObject:
+        field_size = (max(entry[1] for entry in entries.values()).bit_length() + 7) // 8
+        row_size = 1 + field_size + 2
+
+        # The rows hardly differ, so the PNG "Up" predictor makes them compress well.
+        data = bytearray()
+        previous_row = bytes(row_size)
+        for idnum in sorted(entries):
+            entry_type, field2, field3 = entries[idnum]
+            row = bytes((entry_type, *field2.to_bytes(field_size, "big"), *field3.to_bytes(2, "big")))
+            data.append(2)
+            data.extend((byte - previous_byte) & 0xFF for byte, previous_byte in zip(row, previous_row))
+            previous_row = row
+
+        xref_stream = DecodedStreamObject()
+        xref_stream.update(self._get_trailer_entries())
+        xref_stream[NameObject(TK.SIZE)] = NumberObject(len(entries))
+        xref_stream[NameObject("/Type")] = NameObject("/XRef")
+        xref_stream[NameObject("/W")] = ArrayObject(
+            [NumberObject(1), NumberObject(field_size), NumberObject(2)]
+        )
+        xref_stream.set_data(bytes(data))
+        encoded_stream = xref_stream.flate_encode(level=self._object_stream_level)
+        encoded_stream[NameObject("/DecodeParms")] = DictionaryObject(
+            {NameObject("/Columns"): NumberObject(row_size), NameObject("/Predictor"): NumberObject(12)}
+        )
+        return encoded_stream
 
     def _write_xref_table(
         self, stream: StreamType, object_positions: list[int], free_objects: list[int]
@@ -1567,6 +1681,10 @@ class PdfWriter(PdfDocCommon):
             of certain special objects within the body of the file.
         """
         stream.write(b"trailer\n")
+        self._get_trailer_entries().write_to_stream(stream)
+        stream.write(f"\nstartxref\n{xref_location}\n%%EOF\n".encode())  # eof
+
+    def _get_trailer_entries(self) -> DictionaryObject:
         trailer = DictionaryObject(
             {
                 NameObject(TK.SIZE): NumberObject(len(self._objects) + 1),
@@ -1579,8 +1697,7 @@ class PdfWriter(PdfDocCommon):
             trailer[NameObject(TK.ID)] = self._ID
         if self._encrypt_entry:
             trailer[NameObject(TK.ENCRYPT)] = self._encrypt_entry.indirect_reference
-        trailer.write_to_stream(stream)
-        stream.write(f"\nstartxref\n{xref_location}\n%%EOF\n".encode())  # eof
+        return trailer
 
     @property
     def metadata(self) -> DocumentInformation | None:
@@ -1657,6 +1774,207 @@ class PdfWriter(PdfDocCommon):
         if remove_orphans != self._UNSET:
             deprecation_with_replacement("remove_orphans", "remove_unreferenced", "7.0.0")
 
+        # Merging objects can make the objects which use them identical.
+        # Limit the rounds as a chain of such objects could be as long as the file.
+        for _ in range(_MAX_MERGE_ROUNDS):
+            if not self._merge_identical_objects(remove_duplicates):
+                break
+
+        if remove_unreferenced:
+            reachable = self._find_reachable_objects()
+            for idnum in range(1, len(self._objects) + 1):
+                if idnum not in reachable:
+                    self._objects[idnum - 1] = None
+
+    def compress(
+        self, level: int = 10, *, image_quality: int | None = None, image_max_dpi: int | None = None
+    ) -> None:
+        """
+        Make the file as small as possible without changing its content.
+
+        This merges identical objects, removes unreferenced objects and page
+        thumbnails, which PDF readers can create themselves, compresses the streams
+        again if that makes them smaller, removes font tables which PDF does not use,
+        and enables :attr:`use_object_streams`.
+        Recommended to be used just before writing output.
+
+        The output needs PDF 1.5. For PDF/A files, no metadata stream gets compressed,
+        and PDF/A-1 files do not get object streams as that part forbids them.
+
+        By default, this keeps every pixel. The two image parameters give up image
+        quality, and no check can tell if that is acceptable for your images: JPEG
+        is fine for photos, but it changes charts, scans of text and images which
+        carry data. They need Pillow. Images with few colors stay lossless, and
+        so do masks and images with unusual color spaces.
+
+        Args:
+            level: The compression level for the streams, from 1 (fastest) to
+                12 (smallest). Levels above 9 need the ``deflate`` package,
+                otherwise they mean level 9. It takes about as long as zlib but
+                gives smaller files, and all PDF readers can decode its output.
+            image_quality: Store images as JPEG with this quality, from 1 to 95,
+                if that makes them clearly smaller.
+            image_max_dpi: Reduce images which appear on a page with more than
+                this resolution. Images whose use cannot be determined exactly
+                count as if they filled the page, so they can keep a higher
+                resolution.
+
+        """
+        if self.incremental:
+            raise NotImplementedError("Compressing incremental updates is not supported.")
+        if image_quality is not None and not 1 <= image_quality <= 95:
+            raise ValueError(f"image_quality must be between 1 and 95, got {image_quality}.")
+        if image_max_dpi is not None and image_max_dpi <= 0:
+            raise ValueError(f"image_max_dpi must be positive, got {image_max_dpi}.")
+
+        for page in self.pages:
+            page.pop("/Thumb", None)
+        self.compress_identical_objects(remove_duplicates=True, remove_unreferenced=True)
+        if image_quality is not None or image_max_dpi is not None:
+            self._compress_images(level, image_quality, image_max_dpi)
+        self._remove_unused_font_tables(level)
+        try:
+            xmp = self.xmp_metadata
+            pdfa_part = None if xmp is None else xmp.pdfaid_part
+        except PdfReadError:
+            pdfa_part = None
+        self._optimize_jpegs(level)
+        self._recompress_streams(level, keep_all_metadata=pdfa_part is not None)
+        self._object_stream_level = level
+        self.use_object_streams = str(pdfa_part) != "1"
+
+    def _optimize_jpegs(self, level: int) -> None:
+        if not jpeg_optimization_is_available():
+            return
+        streams = []
+        jpegs = []
+        for obj in self._objects:
+            if isinstance(obj, EncodedStreamObject):
+                jpeg = obj._get_jpeg()
+                if jpeg is not None:
+                    streams.append(obj)
+                    jpegs.append(jpeg)
+        for stream, optimized in zip(streams, optimize_jpegs(jpegs)):
+            if optimized is not None:
+                stream._replace_jpeg(optimized, level)
+
+    def _remove_unused_font_tables(self, level: int) -> None:
+        font_files: set[int] = set()
+        for obj in self._objects:
+            if isinstance(obj, DictionaryObject) and "/FontFile2" in obj:
+                font_file = obj.raw_get("/FontFile2")
+                if isinstance(font_file, IndirectObject):
+                    font_files.add(font_file.idnum)
+        for idnum in font_files:
+            font_file = self._objects[idnum - 1]
+            if not isinstance(font_file, EncodedStreamObject) or not font_file._is_only_flate_encoded():
+                continue
+            font = font_file._decode_flate_exactly()
+            reduced = None if font is None else remove_unused_font_tables(font)
+            if reduced is not None:
+                font_file._data = FlateDecode.encode(reduced, level)
+                font_file[NameObject("/Length1")] = NumberObject(len(reduced))
+
+    def _compress_images(self, level: int, quality: int | None, max_dpi: int | None) -> None:
+        from ._image_compression import compress_image  # noqa: PLC0415
+
+        masks = self._find_masks()
+        page_sizes = self._find_page_sizes_of_images() if max_dpi is not None else {}
+        shown_sizes = self._find_shown_image_sizes() if max_dpi is not None else {}
+        for index, obj in enumerate(self._objects):
+            idnum = index + 1
+            if not isinstance(obj, StreamObject) or obj.get("/Subtype") != "/Image":
+                continue
+            scale = 1.0
+            width, height = cast(int, obj.get("/Width", 0)), cast(int, obj.get("/Height", 0))
+            if max_dpi is not None and idnum in shown_sizes and width and height:
+                shown_width, shown_height = shown_sizes[idnum]
+                if shown_width and shown_height:
+                    dpi = min(width / (shown_width / 72), height / (shown_height / 72))
+                    scale = min(1.0, max_dpi / dpi)
+            elif max_dpi is not None and idnum in page_sizes and max(width, height):
+                scale = min(1.0, max_dpi / (max(width, height) / (page_sizes[idnum] / 72)))
+            # A mask stays lossless, and /Matte needs the size of the image it belongs to.
+            is_mask = idnum in masks
+            if is_mask and "/Matte" in obj:
+                continue
+            compressed = compress_image(obj, level, None if is_mask else quality, scale)
+            if compressed is not None:
+                self._objects[index] = compressed
+
+    def _find_shown_image_sizes(self) -> dict[int, tuple[float, float]]:
+        sizes = find_image_sizes(self.pages, self._objects)
+        # A mask has its own resolution, but it covers the same area as its image.
+        for idnum, size in list(sizes.items()):
+            image = self._objects[idnum - 1]
+            mask = image.raw_get("/SMask") if isinstance(image, StreamObject) and "/SMask" in image else None
+            if isinstance(mask, IndirectObject):
+                sizes[mask.idnum] = size
+        return sizes
+
+    def _find_masks(self) -> set[int]:
+        """Get the numbers of all objects which serve as a mask of an image."""
+        masks: set[int] = set()
+        for obj in self._objects:
+            if isinstance(obj, StreamObject):
+                for key in ("/SMask", "/Mask"):
+                    value = obj.raw_get(key) if key in obj else None
+                    if isinstance(value, IndirectObject):
+                        masks.add(value.idnum)
+        return masks
+
+    def _find_page_sizes_of_images(self) -> dict[int, float]:
+        """Map the object number of each image to the longest side of the largest page using it, in points."""
+        sizes: dict[int, float] = {}
+        for page in self.pages:
+            try:
+                box = page.mediabox
+            except ValueError:
+                continue
+            longest_side = float(max(box.width, box.height)) * float(page.user_unit)
+            seen: set[int] = set()
+            todo = [page.get("/Resources")]
+            while todo:
+                resources = todo.pop()
+                xobjects = resources.get("/XObject") if isinstance(resources, DictionaryObject) else None
+                if not isinstance(xobjects, DictionaryObject):
+                    continue
+                for reference in xobjects.values():
+                    xobject = reference.get_object() if isinstance(reference, IndirectObject) else None
+                    if not isinstance(xobject, StreamObject) or reference.idnum in seen:
+                        continue
+                    seen.add(reference.idnum)
+                    if xobject.get("/Subtype") == "/Image":
+                        sizes[reference.idnum] = max(sizes.get(reference.idnum, 0.0), longest_side)
+                        mask = xobject.raw_get("/SMask") if "/SMask" in xobject else None
+                        if isinstance(mask, IndirectObject):
+                            sizes[mask.idnum] = max(sizes.get(mask.idnum, 0.0), longest_side)
+                    elif xobject.get("/Subtype") == "/Form":
+                        todo.append(xobject.get("/Resources"))
+        return sizes
+
+    def _recompress_streams(self, level: int, keep_all_metadata: bool) -> None:
+        """Compress streams again where that saves space, without any lossy step."""
+        document_metadata = self.root_object.raw_get("/Metadata") if "/Metadata" in self.root_object else None
+        for index, obj in enumerate(self._objects):
+            if not isinstance(obj, StreamObject):
+                continue
+            # Metadata should be readable without PDF tools, see §14.3.2 of the PDF 2.0 specification.
+            if obj.indirect_reference == document_metadata or (keep_all_metadata and obj.get("/Type") == "/Metadata"):
+                continue
+            if isinstance(obj, EncodedStreamObject):
+                use_palette(obj, level)
+                if not use_group4(obj) and not obj._add_png_predictor(level):
+                    obj._recompress_flate(level)
+            elif StreamAttributes.FILTER not in obj:
+                encoded = obj.flate_encode(level)
+                if len(encoded._data) + len(b"/Filter /FlateDecode\n") < len(obj.get_data()):
+                    encoded.indirect_reference = obj.indirect_reference
+                    self._objects[index] = encoded
+
+    def _merge_identical_objects(self, remove_duplicates: bool) -> bool:
+        """Keep one of each group of identical objects, and tell if there were any others."""
+
         def replace_in_obj(
             obj: PdfObject, crossref: dict[IndirectObject, IndirectObject]
         ) -> None:
@@ -1669,7 +1987,6 @@ class PdfWriter(PdfDocCommon):
             assert isinstance(obj, (DictionaryObject, ArrayObject))
             for k, v in key_val:
                 if isinstance(v, IndirectObject):
-                    unreferenced[v.idnum - 1] = False
                     if v in crossref:
                         obj[k] = crossref[v]
                 else:
@@ -1679,7 +1996,6 @@ class PdfWriter(PdfDocCommon):
 
         # _idnum_hash: dict[hash] = (1st_ind_obj, [2nd_ind_obj,...])
         self._idnum_hash = {}
-        unreferenced = [True] * len(self._objects)
         # look for similar objects
         for idx, obj in enumerate(self._objects):
             if is_null_or_none(obj):
@@ -1687,7 +2003,9 @@ class PdfWriter(PdfDocCommon):
             assert obj is not None, "mypy"  # mypy: TypeGuard of `is_null_or_none` does not help here.
             assert isinstance(obj.indirect_reference, IndirectObject)
             h = obj.hash_value()
-            if remove_duplicates and h in self._idnum_hash:
+            # An annotation may only be used once, see §12.5.2 of the PDF 2.0 specification.
+            is_annotation = isinstance(obj, DictionaryObject) and "/Rect" in obj and "/Subtype" in obj
+            if remove_duplicates and h in self._idnum_hash and not is_annotation:
                 self._idnum_hash[h][1].append(obj.indirect_reference)
                 self._objects[idx] = None
             else:
@@ -1703,20 +2021,28 @@ class PdfWriter(PdfDocCommon):
         for obj in self._objects:
             if isinstance(obj, (DictionaryObject, ArrayObject)):
                 replace_in_obj(obj, cnv_rev)
+        if self._info_obj in cnv_rev:
+            self._info_obj = cnv_rev[cast(IndirectObject, self._info_obj)]
 
-        if remove_unreferenced:
-            unreferenced[self.root_object.indirect_reference.idnum - 1] = False  # type: ignore[union-attr]
+        return len(cnv_rev) > 0
 
-            if not is_null_or_none(self._info):
-                unreferenced[self._info.indirect_reference.idnum - 1] = False  # type: ignore[union-attr]
-
-            try:
-                unreferenced[self._ID.indirect_reference.idnum - 1] = False  # type: ignore[union-attr]
-            except AttributeError:
-                pass
-
-            for i in compress(range(len(self._objects)), unreferenced):
-                self._objects[i] = None
+    def _find_reachable_objects(self) -> set[int]:
+        """Get the numbers of all objects which the trailer leads to."""
+        reachable: set[int] = set()
+        todo: list[Any] = []
+        for obj in (self._root_object, self._info, self._ID, self._encrypt_entry):
+            todo.extend((obj, getattr(obj, "indirect_reference", None)))
+        while todo:
+            obj = todo.pop()
+            if isinstance(obj, IndirectObject):
+                if obj.pdf is self and obj.idnum not in reachable and 0 < obj.idnum <= len(self._objects):
+                    reachable.add(obj.idnum)
+                    todo.append(self._objects[obj.idnum - 1])
+            elif isinstance(obj, DictionaryObject):
+                todo.extend(obj.values())
+            elif isinstance(obj, ArrayObject):
+                todo.extend(obj)
+        return reachable
 
     def get_reference(self, obj: PdfObject) -> IndirectObject:
         idnum = self._objects.index(obj) + 1

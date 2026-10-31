@@ -1,8 +1,11 @@
 """Test the pypdf._writer module."""
 
+import base64
+import os
 import re
 import shutil
 import subprocess
+import zlib
 from io import BytesIO
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -19,7 +22,9 @@ from pypdf import (
     PdfWriter,
     Transformation,
 )
+from pypdf._crypt_providers import crypt_provider
 from pypdf._utils import get_stream_data
+from pypdf._writer import _MAX_MERGE_ROUNDS
 from pypdf.annotations import Link
 from pypdf.constants import FieldDictionaryAttributes
 from pypdf.errors import DeprecationError, LimitReachedError, PageSizeNotDefinedError, PdfReadError, PyPdfError
@@ -30,6 +35,7 @@ from pypdf.generic import (
     DecodedStreamObject,
     Destination,
     DictionaryObject,
+    EncodedStreamObject,
     Fit,
     IndirectObject,
     NameObject,
@@ -39,9 +45,12 @@ from pypdf.generic import (
     StreamObject,
     TextStringObject,
     TreeObject,
+    create_string_object,
 )
+from pypdf.generic._data_structures import _apply_png_predictor
 from pypdf.generic._font import Font
 from pypdf.generic._viewerpref import BOX_NAMES
+from pypdf.xmp import XmpInformation
 
 from . import RESOURCE_ROOT, SAMPLE_ROOT, get_data_from_url, is_sublist
 from .test_images import image_similarity
@@ -3054,6 +3063,131 @@ def test_compress_identical_objects__remove_unreferenced():
         writer.get_object(reference)
 
 
+def test_compress_identical_objects__removes_what_only_unreferenced_objects_use():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    last = writer._add_object(DictionaryObject({NameObject("/Name"): NameObject("/Last")}))
+    first = writer._add_object(DictionaryObject({NameObject("/Next"): last}))
+    circle = writer._add_object(DictionaryObject())
+    circle.get_object()[NameObject("/Next")] = writer._add_object(DictionaryObject({NameObject("/Next"): circle}))
+    objects_before = sum(obj is not None for obj in writer._objects)
+
+    writer.compress_identical_objects(remove_duplicates=False)
+
+    assert writer._objects[first.idnum - 1] is None
+    assert writer._objects[last.idnum - 1] is None
+    assert writer._objects[circle.idnum - 1] is None
+    assert sum(obj is not None for obj in writer._objects) == objects_before - 4
+    assert writer.pages[0].extract_text().startswith("The Crazy Ones")
+
+
+def test_compress_identical_objects__keeps_encryption():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    writer.encrypt("password", algorithm="RC4-40")
+    writer.compress_identical_objects()
+    output = BytesIO()
+    writer.write(output)
+
+    reader = PdfReader(output, password="password")
+    assert reader.pages[0].extract_text().startswith("The Crazy Ones")
+
+
+def test_compress_identical_objects__merges_objects_using_merged_objects():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    users = []
+    for _ in range(2):
+        used = writer._add_object(DictionaryObject({NameObject("/Name"): NameObject("/Used")}))
+        users.append(writer._add_object(DictionaryObject({NameObject("/Uses"): used})))
+    writer.root_object[NameObject("/TestUsers")] = ArrayObject(users)
+
+    writer.compress_identical_objects()
+
+    kept = writer.root_object["/TestUsers"]
+    assert kept[0] == kept[1]
+    assert writer._objects[users[1].idnum - 1] is None
+
+
+def test_compress_identical_objects__limits_rounds():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    chains = []
+    for _ in range(2):
+        link = writer._add_object(DictionaryObject({NameObject("/Name"): NameObject("/End")}))
+        for _ in range(2 * _MAX_MERGE_ROUNDS):
+            link = writer._add_object(DictionaryObject({NameObject("/Next"): link}))
+        chains.append(link)
+    writer.root_object[NameObject("/TestChains")] = ArrayObject(chains)
+
+    with mock.patch.object(writer, "_merge_identical_objects", wraps=writer._merge_identical_objects) as merge:
+        writer.compress_identical_objects()
+
+    assert merge.call_count == _MAX_MERGE_ROUNDS
+
+
+def test_compress_identical_objects__keeps_annotations_separate():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    annotations = [
+        writer._add_object(
+            DictionaryObject(
+                {
+                    NameObject("/Subtype"): NameObject("/Square"),
+                    NameObject("/Rect"): ArrayObject([NumberObject(0)] * 4),
+                }
+            )
+        )
+        for _ in range(2)
+    ]
+    writer.pages[0][NameObject("/Annots")] = ArrayObject(annotations)
+
+    writer.compress_identical_objects()
+
+    assert list(writer.pages[0]["/Annots"]) == annotations
+    assert all(annotation.get_object() is not None for annotation in annotations)
+
+
+def test_compress_identical_objects__merges_numbers():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    numbers = [writer._add_object(NumberObject(42)) for _ in range(2)]
+    writer.root_object[NameObject("/TestNumbers")] = ArrayObject(numbers)
+
+    writer.compress_identical_objects()
+
+    kept = writer.root_object["/TestNumbers"]
+    assert kept[0] == kept[1]
+
+
+def test_compress_identical_objects__keeps_merged_metadata():
+    writer = PdfWriter()
+    writer.add_blank_page(width=100, height=100)
+    info = {NameObject("/Title"): create_string_object("Merged with a twin")}
+    twin = writer._add_object(DictionaryObject(info))
+    writer.root_object[NameObject("/TestTwin")] = twin
+    writer._info_obj = writer._add_object(DictionaryObject(info))
+
+    writer.compress_identical_objects()
+
+    assert writer.metadata.title == "Merged with a twin"
+    output = BytesIO()
+    writer.write(output)
+    assert PdfReader(output).metadata.title == "Merged with a twin"
+
+
+def test_compress_identical_objects__does_not_decode_streams():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    streams = []
+    for _ in range(2):
+        stream = EncodedStreamObject()
+        stream[NameObject("/Filter")] = NameObject("/FlateDecode")
+        stream._data = b"This is not valid Flate data."
+        streams.append(writer._add_object(stream))
+    writer.root_object[NameObject("/TestStreams")] = ArrayObject(streams)
+
+    writer.compress_identical_objects()
+
+    kept = writer.root_object["/TestStreams"]
+    assert kept[0] == kept[1]
+    assert kept[0].get_object().decoded_self is None
+    assert writer._objects[streams[1].idnum - 1] is None
+
+
 def test_compress_identical_objects__deprecation():
     writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
     with pytest.raises(
@@ -3089,6 +3223,7 @@ def test_utf16_metadata():
             "/Subject": "Invoice №AI_047",
         }
     )
+    writer.use_object_streams = False
     b = BytesIO()
     writer.write(b)
     b.seek(0)
@@ -4094,3 +4229,502 @@ def test_find_outline_item__cyclic(name: str) -> None:
 
     with pytest.raises(expected_exception=LimitReachedError, match=r"^Detected cyclic outline hierarchy\.$"):
         writer.find_outline_item("Dummy")
+
+
+def _write_with_object_streams(writer: PdfWriter) -> BytesIO:
+    writer.use_object_streams = True
+    output = BytesIO()
+    writer.write(output)
+    return output
+
+
+def test_use_object_streams():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    writer.pdf_header = "%PDF-1.3"
+    writer.add_metadata({"/Title": "Stored in an object stream"})
+    expected_text = writer.pages[0].extract_text()
+
+    output = _write_with_object_streams(writer)
+
+    data = output.getvalue()
+    assert data.startswith(b"%PDF-1.5\n")
+    assert b"/Type /ObjStm" in data
+    assert b"/Type /XRef" in data
+    assert b"\nxref\n" not in data
+    assert b"\ntrailer\n" not in data
+    assert b"/Type /Catalog" not in data
+    assert writer.pdf_header == "%PDF-1.3"
+
+    written = PdfReader(output, strict=True)
+    assert written.pages[0].extract_text() == expected_text
+    assert written.metadata.title == "Stored in an object stream"
+    assert written.root_object.indirect_reference.idnum in written.xref_objStm
+
+
+def test_use_object_streams__keeps_higher_version():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    writer.pdf_header = "%PDF-1.7"
+    assert _write_with_object_streams(writer).getvalue().startswith(b"%PDF-1.7\n")
+
+
+def test_use_object_streams__many_objects():
+    """Object streams stay small, and object numbers can need more than one byte."""
+    writer = PdfWriter()
+    writer.add_blank_page(width=100, height=100)
+    references = [
+        writer._add_object(DictionaryObject({NameObject("/Number"): NumberObject(number)}))
+        for number in range(1000)
+    ]
+    writer.root_object[NameObject("/TestObjects")] = ArrayObject(references)
+
+    written = PdfReader(_write_with_object_streams(writer), strict=True)
+
+    numbers = [reference.get_object()["/Number"] for reference in written.root_object["/TestObjects"]]
+    assert numbers == list(range(1000))
+    assert len({number for number, _ in written.xref_objStm.values()}) == 3
+
+
+def test_use_object_streams__free_objects():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    unused = [writer._add_object(DictionaryObject()) for _ in range(3)]
+    for reference in unused:
+        writer._objects[reference.idnum - 1] = None
+
+    output = _write_with_object_streams(writer)
+
+    written = PdfReader(output, strict=True)
+    assert len(written.pages) == 1
+    for reference in unused:
+        assert reference.idnum not in written.xref_objStm
+        assert reference.idnum not in written.xref[0]
+
+
+def test_use_object_streams__keeps_signatures_uncompressed():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    signature = writer._add_object(
+        DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Sig"),
+                NameObject("/ByteRange"): ArrayObject([NumberObject(0)] * 4),
+            }
+        )
+    )
+    writer.root_object[NameObject("/TestSignature")] = signature
+
+    output = _write_with_object_streams(writer)
+
+    assert b"/ByteRange" in output.getvalue()
+    assert signature.idnum not in PdfReader(output).xref_objStm
+
+
+def test_use_object_streams__writes_the_same_again():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    object_count = len(writer._objects)
+    assert _write_with_object_streams(writer).getvalue() == _write_with_object_streams(writer).getvalue()
+    assert len(writer._objects) == object_count
+
+
+def test_use_object_streams__not_for_incremental_updates():
+    writer = PdfWriter(RESOURCE_ROOT / "crazyones.pdf", incremental=True)
+    writer.add_metadata({"/Title": "Changed"})
+    output = _write_with_object_streams(writer)
+    assert b"/Type /ObjStm" not in output.getvalue()
+    assert PdfReader(output).metadata.title == "Changed"
+
+
+def test_use_object_streams__read_by_incremental_writer():
+    output = _write_with_object_streams(PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf"))
+    writer = PdfWriter(output, incremental=True)
+    writer.add_metadata({"/Title": "Changed"})
+    updated = BytesIO()
+    writer.write(updated)
+    assert PdfReader(updated).metadata.title == "Changed"
+
+
+@pytest.mark.parametrize(
+    "algorithm",
+    [
+        "RC4-40",
+        "RC4-128",
+        pytest.param("AES-128", marks=pytest.mark.skipif(crypt_provider[0] == "local_crypt_fallback", reason="No AES")),
+        pytest.param("AES-256", marks=pytest.mark.skipif(crypt_provider[0] == "local_crypt_fallback", reason="No AES")),
+    ],
+)
+def test_use_object_streams__encryption(algorithm):
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    writer.add_metadata({"/Title": "A secret title"})
+    expected_text = writer.pages[0].extract_text()
+    writer.encrypt("password", algorithm=algorithm)
+
+    output = _write_with_object_streams(writer)
+
+    data = output.getvalue()
+    assert b"A secret title" not in data
+    assert b"/Filter /Standard" in data
+    assert b"/Type /ObjStm" in data
+    reader = PdfReader(output, password="password", strict=True)
+    assert reader.metadata.title == "A secret title"
+    assert reader.pages[0].extract_text() == expected_text
+
+
+@pytest.mark.parametrize(
+    ("name", "object_streams"),
+    [("crazyones.pdf", True), ("multilang.pdf", False)],
+)
+def test_use_object_streams__follows_the_cloned_document(name, object_streams):
+    reader = PdfReader(RESOURCE_ROOT / name)
+    assert (len(reader.xref_objStm) > 0) is object_streams
+
+    assert PdfWriter(clone_from=reader).use_object_streams is object_streams
+    assert PdfWriter().use_object_streams is False
+
+    writer = PdfWriter()
+    writer.append(reader)
+    assert writer.use_object_streams is False
+
+
+def test_compress():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    expected_text = writer.pages[0].extract_text()
+    streams = []
+    for _ in range(2):
+        stream = StreamObject()
+        stream.set_data(b"Some very repetitive data. " * 1000)
+        streams.append(writer._add_object(stream))
+    writer.root_object[NameObject("/TestStreams")] = ArrayObject(streams)
+    unused = writer._add_object(DictionaryObject())
+
+    writer.compress()
+
+    assert writer.use_object_streams is True
+    assert writer._objects[unused.idnum - 1] is None
+    output = BytesIO()
+    writer.write(output)
+    reader = PdfReader(output, strict=True)
+    assert reader.pages[0].extract_text() == expected_text
+    kept = reader.root_object["/TestStreams"]
+    assert kept[0] == kept[1]
+    assert kept[0].get_object().get_data() == b"Some very repetitive data. " * 1000
+    assert kept[0].get_object()["/Filter"] == "/FlateDecode"
+    assert len(kept[0].get_object()._data) < 200
+
+
+def test_compress__not_for_incremental_updates():
+    writer = PdfWriter(RESOURCE_ROOT / "crazyones.pdf", incremental=True)
+    with pytest.raises(NotImplementedError, match=r"^Compressing incremental updates is not supported\.$"):
+        writer.compress()
+
+
+def test_compress__after_compressing_content_streams():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    expected_text = writer.pages[0].extract_text()
+    writer.pages[0].compress_content_streams(level=9)
+    writer.compress()
+    output = BytesIO()
+    writer.write(output)
+    assert PdfReader(output).pages[0].extract_text() == expected_text
+
+
+def test_compress__encoded_content_stream():
+    """Content streams which pypdf changed are objects of their own type."""
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=100, height=100)
+    page.merge_page(PdfReader(RESOURCE_ROOT / "crazyones.pdf").pages[0])
+    expected_text = page.extract_text()
+    writer.compress()
+    output = BytesIO()
+    writer.write(output)
+    assert PdfReader(output).pages[0].extract_text() == expected_text
+
+
+def test_compress__leaves_small_streams_unfiltered():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    stream = StreamObject()
+    stream.set_data(b"x" * 20)
+    reference = writer._add_object(stream)
+    writer.root_object[NameObject("/TestStream")] = reference
+
+    writer.compress()
+
+    assert "/Filter" not in reference.get_object()
+
+
+def _add_metadata_streams(writer: PdfWriter, pdfa_part: str | None) -> IndirectObject:
+    xmp = XmpInformation.create()
+    xmp.pdfaid_part = pdfa_part
+    xmp.dc_title = {"x-default": "Compressible metadata " * 100}
+    writer.xmp_metadata = xmp
+
+    stream = StreamObject()
+    stream[NameObject("/Type")] = NameObject("/Metadata")
+    stream.set_data(b"<metadata>Compressible metadata</metadata>" * 100)
+    reference = writer._add_object(stream)
+    writer.pages[0][NameObject("/Metadata")] = reference
+    return reference
+
+
+@pytest.mark.parametrize(
+    ("pdfa_part", "object_streams", "page_metadata_compressed"),
+    [(None, True, True), ("1", False, False), ("2", True, False), ("3", True, False)],
+)
+def test_compress__keeps_metadata_and_pdfa(pdfa_part, object_streams, page_metadata_compressed):
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    page_metadata = _add_metadata_streams(writer, pdfa_part)
+
+    writer.compress()
+
+    assert "/Filter" not in writer.root_object["/Metadata"]
+    assert ("/Filter" in page_metadata.get_object()) is page_metadata_compressed
+    assert writer.use_object_streams is object_streams
+
+
+def test_compress__ignores_invalid_xmp():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    stream = StreamObject()
+    stream[NameObject("/Type")] = NameObject("/Metadata")
+    stream.set_data(b"This is not XML.")
+    writer.root_object[NameObject("/Metadata")] = writer._add_object(stream)
+
+    writer.compress()
+
+    assert writer.use_object_streams is True
+
+
+def _encoded_stream(data: bytes, filters: NameObject | ArrayObject | None = None) -> EncodedStreamObject:
+    stream = EncodedStreamObject()
+    stream[NameObject("/Filter")] = NameObject("/FlateDecode") if filters is None else filters
+    stream._data = data
+    return stream
+
+
+REPETITIVE_DATA = b"Some repetitive data with a few numbers. 0 1 2 3 4 5 6 7 8 9\n" * 200
+
+
+@pytest.mark.parametrize("flate_name", ["/FlateDecode", "/Fl"])
+def test_recompress_flate(flate_name):
+    data = zlib.compress(REPETITIVE_DATA, 1)
+    stream = _encoded_stream(data, NameObject(flate_name))
+
+    stream._recompress_flate(9)
+
+    assert len(stream._data) < len(data)
+    assert zlib.decompress(stream._data) == REPETITIVE_DATA
+
+
+def test_recompress_flate__only_touches_the_outer_filter():
+    data = zlib.compress(base64.a85encode(REPETITIVE_DATA) + b"~>", 1)
+    stream = _encoded_stream(data, ArrayObject([NameObject("/FlateDecode"), NameObject("/ASCII85Decode")]))
+    parameters = ArrayObject([DictionaryObject({NameObject("/Test"): NumberObject(1)}), NullObject()])
+    stream[NameObject("/DecodeParms")] = parameters
+
+    stream._recompress_flate(9)
+
+    assert len(stream._data) < len(data)
+    assert stream["/DecodeParms"] == parameters
+    assert stream["/Filter"] == ["/FlateDecode", "/ASCII85Decode"]
+    assert stream.get_data() == REPETITIVE_DATA
+
+
+def test_recompress_flate__keeps_the_data_if_it_gets_larger():
+    data = zlib.compress(REPETITIVE_DATA, 9)
+    stream = _encoded_stream(data)
+    stream._recompress_flate(1)
+    assert stream._data == data
+
+
+@pytest.mark.parametrize(
+    "filters",
+    [
+        NameObject("/ASCII85Decode"),
+        NameObject("/DCTDecode"),
+        ArrayObject([NameObject("/ASCII85Decode"), NameObject("/FlateDecode")]),
+        ArrayObject(),
+    ],
+)
+def test_recompress_flate__ignores_other_filters(filters):
+    data = zlib.compress(REPETITIVE_DATA, 1)
+    stream = _encoded_stream(data, filters)
+    stream._recompress_flate(9)
+    assert stream._data == data
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param(zlib.compress(REPETITIVE_DATA, 1)[:-20], id="truncated"),
+        pytest.param(zlib.compress(REPETITIVE_DATA, 1)[:-4] + b"BAD!", id="wrong checksum"),
+        pytest.param(zlib.compress(REPETITIVE_DATA, 1) + b"more data", id="trailing data"),
+        pytest.param(b"This is not Flate.", id="no flate data"),
+    ],
+)
+def test_recompress_flate__keeps_streams_which_do_not_decode_cleanly(data):
+    stream = _encoded_stream(data)
+    stream._recompress_flate(9)
+    assert stream._data == data
+
+
+def test_recompress_flate__accepts_trailing_whitespace():
+    data = zlib.compress(REPETITIVE_DATA, 1) + b"\r\n"
+    stream = _encoded_stream(data)
+    stream._recompress_flate(9)
+    assert len(stream._data) < len(data)
+    assert zlib.decompress(stream._data) == REPETITIVE_DATA
+
+
+def test_recompress_flate__respects_the_decompression_limit():
+    data = zlib.compress(REPETITIVE_DATA, 1)
+    stream = _encoded_stream(data)
+    with mock.patch("pypdf.generic._data_structures.get_configuration") as configuration:
+        configuration.return_value.zlib_maximum_output_length = 100
+        stream._recompress_flate(9)
+    assert stream._data == data
+
+
+def test_recompress_flate__skips_large_streams_without_benefit():
+    data = zlib.compress(os.urandom(5 * 64 * 1024), 9)
+    stream = _encoded_stream(data)
+
+    with mock.patch("pypdf.generic._data_structures.zlib.compress", wraps=zlib.compress) as compress:
+        stream._recompress_flate(9)
+
+    assert compress.call_count == 1
+    assert stream._data == data
+
+
+def test_recompress_flate__compresses_large_streams_with_benefit():
+    rows = [b"%d, some text which repeats itself\n" % number for number in range(100_000)]
+    data = zlib.compress(b"".join(rows), 1)
+    assert len(data) > 2 * 64 * 1024
+    stream = _encoded_stream(data)
+
+    stream._recompress_flate(9)
+
+    assert len(stream._data) < len(data)
+    assert zlib.decompress(stream._data) == b"".join(rows)
+
+
+def _naive_png_predictor(data: bytes, row_size: int, pixel_size: int, predictor: int) -> bytes:
+    output = bytearray()
+    previous = bytes(row_size)
+    for start in range(0, len(data), row_size):
+        row = data[start:start + row_size]
+        output.append(predictor)
+        for index, value in enumerate(row):
+            if predictor == 1:
+                other = row[index - pixel_size] if index >= pixel_size else 0
+            else:
+                other = previous[index]
+            output.append((value - other) & 0xFF)
+        previous = row
+    return bytes(output)
+
+
+@pytest.mark.parametrize("predictor", [1, 2])
+@pytest.mark.parametrize(("row_size", "pixel_size"), [(1, 1), (7, 1), (60, 3), (64, 4), (120, 6)])
+def test_apply_png_predictor(predictor, row_size, pixel_size):
+    data = os.urandom(row_size * 50) + bytes(row_size) + b"\xff" * row_size + bytes(row_size)
+    assert _apply_png_predictor(data, row_size, pixel_size, predictor) == _naive_png_predictor(
+        data, row_size, pixel_size, predictor
+    )
+
+
+def _image_stream(data: bytes, width: int, height: int, bits: int = 8) -> EncodedStreamObject:
+    stream = _encoded_stream(zlib.compress(data, 9))
+    stream[NameObject("/Subtype")] = NameObject("/Image")
+    stream[NameObject("/Width")] = NumberObject(width)
+    stream[NameObject("/Height")] = NumberObject(height)
+    stream[NameObject("/BitsPerComponent")] = NumberObject(bits)
+    return stream
+
+
+def _gradient(width: int, height: int, colors: int) -> bytes:
+    """A smooth image which compresses far better with a predictor."""
+    return bytes(
+        ((x * x + y * 7 + color * 11) // 16) & 0xFF
+        for y in range(height)
+        for x in range(width)
+        for color in range(colors)
+    )
+
+
+@pytest.mark.parametrize("colors", [1, 3, 4])
+def test_add_png_predictor(colors):
+    data = _gradient(300, 200, colors)
+    stream = _image_stream(data, 300, 200)
+    size_before = len(stream._data)
+
+    assert stream._add_png_predictor(9) is True
+
+    assert len(stream._data) < size_before
+    assert stream["/DecodeParms"] == {
+        "/BitsPerComponent": 8,
+        "/Colors": colors,
+        "/Columns": 300,
+        "/Predictor": 15,
+    }
+    assert stream.get_data() == data
+
+
+def test_add_png_predictor__sixteen_bits():
+    data = b"".join(bytes((y, x % 256)) * 3 for y in range(200) for x in range(300))
+    stream = _image_stream(data, 300, 200, bits=16)
+    assert stream._add_png_predictor(9) is True
+    assert stream["/DecodeParms"]["/Colors"] == 3
+    assert stream.get_data() == data
+
+
+def test_add_png_predictor__keeps_images_without_benefit():
+    data = os.urandom(300 * 200 * 3)
+    stream = _image_stream(data, 300, 200)
+    encoded = stream._data
+    assert stream._add_png_predictor(9) is False
+    assert stream._data == encoded
+    assert "/DecodeParms" not in stream
+
+
+def test_add_png_predictor__ignores_other_streams():
+    data = _gradient(300, 200, 3)
+
+    not_an_image = _image_stream(data, 300, 200)
+    del not_an_image["/Subtype"]
+    assert not_an_image._add_png_predictor(9) is False
+
+    with_parameters = _image_stream(data, 300, 200)
+    with_parameters[NameObject("/DecodeParms")] = DictionaryObject()
+    assert with_parameters._add_png_predictor(9) is False
+
+    other_filter = _image_stream(data, 300, 200)
+    other_filter[NameObject("/Filter")] = NameObject("/DCTDecode")
+    assert other_filter._add_png_predictor(9) is False
+
+    two_filters = _image_stream(data, 300, 200)
+    two_filters[NameObject("/Filter")] = ArrayObject([NameObject("/FlateDecode"), NameObject("/ASCII85Decode")])
+    assert two_filters._add_png_predictor(9) is False
+
+    wrong_size = _image_stream(data + b"more", 300, 200)
+    assert wrong_size._add_png_predictor(9) is False
+
+    no_width = _image_stream(data, 300, 200)
+    del no_width["/Width"]
+    assert no_width._add_png_predictor(9) is False
+
+    broken = _image_stream(data, 300, 200)
+    broken._data = broken._data[:-20]
+    assert broken._add_png_predictor(9) is False
+
+
+def test_compress__images_keep_their_pixels():
+    data = _gradient(300, 200, 3)
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    stream = _image_stream(data, 300, 200)
+    stream[NameObject("/ColorSpace")] = NameObject("/DeviceRGB")
+    writer.pages[0][NameObject("/Resources")][NameObject("/XObject")] = DictionaryObject(
+        {NameObject("/Test"): writer._add_object(stream)}
+    )
+    writer.compress()
+    output = BytesIO()
+    writer.write(output)
+
+    image = PdfReader(output).pages[0]["/Resources"]["/XObject"]["/Test"]
+    assert image["/DecodeParms"]["/Predictor"] == 15
+    assert image.get_data() == data

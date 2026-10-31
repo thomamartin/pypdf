@@ -32,6 +32,7 @@ import logging
 import os
 import re
 import sys
+import zlib
 from collections.abc import Callable, Iterable, Sequence
 from io import BytesIO
 from math import ceil
@@ -62,6 +63,7 @@ from ..constants import (
     OutlineFontFlag,
     StreamAttributes,
 )
+from ..constants import FilterTypeAbbreviations as FTA
 from ..constants import FilterTypes as FT
 from ..constants import TypArguments as TA
 from ..constants import TypFitArguments as TF
@@ -1214,6 +1216,30 @@ class StreamObject(DictionaryObject):
         return img
 
 
+_RECOMPRESSION_PROBE_SIZE = 64 * 1024
+_PREDICTOR_SAMPLE_SIZE = 256 * 1024
+
+
+def _apply_png_predictor(data: bytes, row_size: int, pixel_size: int, predictor: int) -> bytes:
+    """
+    Apply the PNG predictor 1 (Sub) or 2 (Up) to all rows.
+
+    A row as a large integer allows subtracting all bytes at once at the speed of C.
+    """
+    high_bits = int.from_bytes(b"\x80" * row_size, "big")
+    all_bits = (1 << (8 * row_size)) - 1
+    tag = bytes((predictor,))
+    output: list[bytes] = []
+    previous = 0
+    for start in range(0, len(data), row_size):
+        row = int.from_bytes(data[start:start + row_size], "big")
+        subtrahend = row >> (8 * pixel_size) if predictor == 1 else previous
+        difference = ((row | high_bits) - (subtrahend & ~high_bits)) ^ ((row ^ ~subtrahend) & high_bits)
+        output.extend((tag, (difference & all_bits).to_bytes(row_size, "big")))
+        previous = row
+    return b"".join(output)
+
+
 class DecodedStreamObject(StreamObject):
     pass
 
@@ -1221,6 +1247,135 @@ class DecodedStreamObject(StreamObject):
 class EncodedStreamObject(StreamObject):
     def __init__(self) -> None:
         self.decoded_self: DecodedStreamObject | None = None
+
+    def hash_value_data(self) -> bytes:
+        # Use _data as decoding is slow, and it would keep a decoded copy in memory.
+        return DictionaryObject.hash_value_data(self) + self._data
+
+    def _is_only_flate_encoded(self) -> bool:
+        filters = self.get(StreamAttributes.FILTER)
+        if isinstance(filters, ArrayObject) and len(filters) == 1:
+            filters = filters[0]
+        return filters in (FT.FLATE_DECODE, FTA.FL)
+
+    def _decode_flate_exactly(self) -> bytes | None:
+        """Decode a Flate stream, or get None if it does not decode cleanly."""
+        decompressor = zlib.decompressobj()
+        try:
+            data = decompressor.decompress(self._data, max_length=get_configuration().zlib_maximum_output_length)
+        except zlib.error:
+            return None
+        return data if decompressor.eof and not decompressor.unused_data.strip() else None
+
+    def _recompress_flate(self, level: int) -> None:
+        """
+        Replace an outermost Flate encoding by a smaller one with the same content.
+
+        Streams which do not decode cleanly stay as they are, as pypdf's lenient
+        decoding could lose data for them.
+        """
+        from ..filters import FlateDecode  # noqa: PLC0415
+
+        filters = self.get(StreamAttributes.FILTER)
+        outer_filter = filters[0] if isinstance(filters, ArrayObject) and filters else filters
+        if outer_filter not in (FT.FLATE_DECODE, FTA.FL):
+            return
+        # Skip the slow part if the beginning of a large stream shows no benefit.
+        if len(self._data) > 2 * _RECOMPRESSION_PROBE_SIZE:
+            limit = get_configuration().zlib_maximum_output_length
+            try:
+                probe = self._data[:_RECOMPRESSION_PROBE_SIZE]
+                beginning = zlib.decompressobj().decompress(probe, max_length=limit)
+            except zlib.error:
+                return
+            if len(FlateDecode.encode(beginning, level)) >= 0.99 * _RECOMPRESSION_PROBE_SIZE:
+                return
+        data = self._decode_flate_exactly()
+        if data is not None:
+            compressed = FlateDecode.encode(data, level)
+            if len(compressed) < len(self._data):
+                self._data = compressed
+
+    def _get_jpeg(self) -> bytes | None:
+        """Get the JPEG file of a stream, which may have an outer Flate encoding."""
+        filters = self.get(StreamAttributes.FILTER)
+        names = list(filters) if isinstance(filters, ArrayObject) else [filters]
+        jpeg_names = (FT.DCT_DECODE, FTA.DCT)
+        if len(names) == 1 and names[0] in jpeg_names:
+            return self._data
+        if len(names) == 2 and names[0] in (FT.FLATE_DECODE, FTA.FL) and names[1] in jpeg_names:
+            return self._decode_flate_exactly()
+        return None
+
+    def _replace_jpeg(self, jpeg: bytes, level: int) -> None:
+        """Store a new JPEG file for a stream if that makes it smaller."""
+        from ..filters import FlateDecode  # noqa: PLC0415
+
+        filters = self.get(StreamAttributes.FILTER)
+        if isinstance(filters, ArrayObject) and len(filters) == 2:
+            jpeg = FlateDecode.encode(jpeg, level)
+        if len(jpeg) < len(self._data):
+            self._data = jpeg
+
+    def _add_png_predictor(self, level: int) -> bool:
+        """
+        Encode an image with a PNG predictor if that makes it smaller.
+
+        Returns:
+            True if the stream has a new encoding.
+
+        """
+        from ..filters import FlateDecode  # noqa: PLC0415
+
+        if self.get("/Subtype") != "/Image" or StreamAttributes.DECODE_PARMS in self:
+            return False
+        if not self._is_only_flate_encoded():
+            return False
+        width = self.get("/Width")
+        height = self.get("/Height")
+        bits = self.get("/BitsPerComponent", 1)
+        if not (isinstance(width, int) and isinstance(height, int) and isinstance(bits, int)):
+            return False
+        if min(width, height, bits) <= 0:
+            return False
+        data = self._decode_flate_exactly()
+        if data is None:
+            return False
+        # The data shows the number of colors, without looking into all kinds of color spaces.
+        colors = next((c for c in (1, 3, 4) if height * ((width * c * bits + 7) // 8) == len(data)), None)
+        if colors is None:
+            return False
+        row_size = (width * colors * bits + 7) // 8
+        pixel_size = max(1, colors * bits // 8)
+
+        # A part from the middle tells which predictor helps, which saves time for all others.
+        rows = max(8, min(height, _PREDICTOR_SAMPLE_SIZE // row_size))
+        first_row = (height - rows) // 2 if height > rows else 0
+        sample = data[first_row * row_size:(first_row + rows) * row_size]
+        unpredicted_size = len(zlib.compress(sample, 6))
+        predictor, predicted_size = min(
+            (
+                (predictor, len(zlib.compress(_apply_png_predictor(sample, row_size, pixel_size, predictor), 6)))
+                for predictor in (1, 2)
+            ),
+            key=lambda item: item[1],
+        )
+        if predicted_size >= 0.97 * unpredicted_size:
+            return False
+
+        compressed = FlateDecode.encode(_apply_png_predictor(data, row_size, pixel_size, predictor), level)
+        if len(compressed) >= len(self._data):
+            return False
+        self._data = compressed
+        self[NameObject(StreamAttributes.DECODE_PARMS)] = DictionaryObject(
+            {
+                NameObject("/BitsPerComponent"): NumberObject(bits),
+                NameObject("/Colors"): NumberObject(colors),
+                NameObject("/Columns"): NumberObject(width),
+                NameObject("/Predictor"): NumberObject(15),
+            }
+        )
+        return True
 
     # This overrides the parent method
     def get_data(self) -> bytes:

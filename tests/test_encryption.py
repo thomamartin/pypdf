@@ -221,6 +221,12 @@ def test_encrypt_decrypt_with_cipher_class(cryptcls):
     assert crypt.decrypt(crypt.encrypt(message)) == message
 
 
+def test_fallback_rc4__known_answer():
+    """The key stream of the fallback matches the test vector of RFC 6229."""
+    crypt = pypdf._crypt_providers._fallback.CryptRC4(bytes.fromhex("0102030405"))
+    assert crypt.encrypt(bytes(16)).hex() == "b2396305f03dc027ccc3524a0a1118a8"
+
+
 @pytest.mark.parametrize(("idnum", "low_three_bytes"), [(2**31, 0), (2**32 + 1, 1), (0x01020304, 0x020304)])
 def test_make_crypt_filter_large_object_number(idnum, low_three_bytes):
     """Object numbers above the signed 32-bit range use only their low-order three bytes."""
@@ -233,6 +239,21 @@ def test_make_crypt_filter_large_object_number(idnum, low_three_bytes):
     reference = encryption._make_crypt_filter(low_three_bytes, 0)
     crypt_filter = encryption._make_crypt_filter(idnum, 0)
     assert crypt_filter.stm_crypt.encrypt(b"hello world") == reference.stm_crypt.encrypt(b"hello world")
+
+
+def test_make_crypt_filter__shares_equal_ciphers():
+    reader = PdfReader(RESOURCE_ROOT / "encryption" / "r3-user-password.pdf", password="asdfzxcv")
+    encryption = reader._encryption
+
+    crypt_filter = encryption._make_crypt_filter(1, 0)
+    assert crypt_filter.str_crypt is crypt_filter.stm_crypt
+    assert crypt_filter.ef_crypt is crypt_filter.stm_crypt
+
+    encryption.StrF = "/Identity"
+    crypt_filter = encryption._make_crypt_filter(1, 0)
+    assert crypt_filter.str_crypt.encrypt(b"text") == b"text"
+    assert crypt_filter.stm_crypt.encrypt(b"text") != b"text"
+    assert crypt_filter.ef_crypt is crypt_filter.stm_crypt
 
 
 def test_attempt_decrypt_unencrypted_pdf():

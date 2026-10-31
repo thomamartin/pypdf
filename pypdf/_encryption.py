@@ -1054,8 +1054,8 @@ class Encryption:
         aes256_key = key
 
         stm_crypt = self._get_crypt(self.StmF, rc4_key, aes128_key, aes256_key)
-        str_crypt = self._get_crypt(self.StrF, rc4_key, aes128_key, aes256_key)
-        ef_crypt = self._get_crypt(self.EFF, rc4_key, aes128_key, aes256_key)
+        str_crypt = stm_crypt if self.StrF == self.StmF else self._get_crypt(self.StrF, rc4_key, aes128_key, aes256_key)
+        ef_crypt = stm_crypt if self.StmF == self.EFF else self._get_crypt(self.EFF, rc4_key, aes128_key, aes256_key)
 
         return CryptFilter(stm_crypt, str_crypt, ef_crypt)
 

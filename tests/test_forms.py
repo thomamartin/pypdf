@@ -19,6 +19,7 @@ def test_form_button__v_value_should_be_name_object():
         {"Other": "/On"},
         auto_regenerate=False,
     )
+    writer.use_object_streams = False
     stream = BytesIO()
     writer.write(stream)
 

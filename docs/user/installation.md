@@ -48,6 +48,14 @@ If you plan to use image extraction, you need Pillow:
 pip install pypdf[image]
 ```
 
+If you want `writer.compress()` to produce smaller files, you need
+[`deflate`](https://pypi.org/project/deflate/) and
+[`mozjpeg-lossless-optimization`](https://pypi.org/project/mozjpeg-lossless-optimization/):
+
+```
+pip install pypdf[compress]
+```
+
 For JBIG2 support, you need to install a global OS-level package as well:
 [`jbig2dec`](https://github.com/ArtifexSoftware/jbig2dec) The installation procedure
 depends on our operating system. For Ubuntu, use the following, for example:

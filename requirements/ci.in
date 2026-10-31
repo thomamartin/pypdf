@@ -1,8 +1,10 @@
 arabic-reshaper
 brotli
 coverage
+deflate
 fonttools
 fpdf2
+mozjpeg-lossless-optimization
 mypy
 pillow
 cryptography

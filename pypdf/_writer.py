@@ -86,6 +86,7 @@ from .generic import (
     BooleanObject,
     ByteStringObject,
     ContentStream,
+    DecodedStreamObject,
     Destination,
     DictionaryObject,
     EmbeddedFile,
@@ -123,6 +124,7 @@ from .xmp import XmpInformation
 ALL_DOCUMENT_PERMISSIONS = UserAccessPermissions.all()
 
 _MAX_MERGE_ROUNDS = 8
+_OBJECTS_PER_OBJECT_STREAM = 100
 
 
 class ObjectDeletionFlag(enum.IntFlag):
@@ -215,6 +217,14 @@ class PdfWriter(PdfDocCommon):
         """
 
         self.incremental = incremental or full
+
+        self.use_object_streams = False
+        """
+        If true, pypdf stores the objects in compressed object streams and writes a
+        cross-reference stream instead of a cross-reference table. This needs at least
+        PDF 1.5, so that a lower version in the header is raised, and it is not available
+        for incremental updates.
+        """
 
         self._objects = []
 
@@ -1387,6 +1397,8 @@ class PdfWriter(PdfDocCommon):
             stream.write(self._reader.stream.read(-1))
             if has_increment:
                 self._write_increment(stream)  # writes objs, xref stream and startxref
+        elif self.use_object_streams:
+            self._write_with_object_streams(stream)
         else:
             object_positions, free_objects = self._write_pdf_structure(stream)
             xref_location = self._write_xref_table(
@@ -1532,16 +1544,107 @@ class PdfWriter(PdfDocCommon):
         for idnum, obj in enumerate(self._objects, start=1):
             if obj is not None:
                 object_positions.append(stream.tell())
-                stream.write(f"{idnum} 0 obj\n".encode())
-                if self._encryption and obj != self._encrypt_entry:
-                    obj = self._encryption.encrypt_object(obj, idnum, 0)
-                obj.write_to_stream(stream)
-                stream.write(b"\nendobj\n")
+                self._write_indirect_object(stream, idnum, obj)
             else:
                 object_positions.append(-1)
                 free_objects.append(idnum)
         free_objects.append(0)  # add 0 to loop in accordance with specification
         return object_positions, free_objects
+
+    def _write_indirect_object(self, stream: StreamType, idnum: int, obj: PdfObject) -> None:
+        stream.write(f"{idnum} 0 obj\n".encode())
+        if self._encryption and obj != self._encrypt_entry:
+            obj = self._encryption.encrypt_object(obj, idnum, 0)
+        obj.write_to_stream(stream)
+        stream.write(b"\nendobj\n")
+
+    def _write_with_object_streams(self, stream: StreamType) -> None:
+        """See §7.5.7 and §7.5.8 of the PDF 1.7 or PDF 2.0 specification."""
+        stream.write(_get_max_pdf_version_header(self.pdf_header, "%PDF-1.5").encode() + b"\n")
+        stream.write(b"%\xE2\xE3\xCF\xD3\n")
+
+        # Maps object numbers to the three fields of a cross-reference stream entry.
+        entries: dict[int, tuple[int, int, int]] = {}
+        compressible = []
+        for idnum, obj in enumerate(self._objects, start=1):
+            if obj is None:
+                continue
+            if self._can_be_in_object_stream(obj):
+                compressible.append((idnum, obj))
+            else:
+                entries[idnum] = (1, stream.tell(), 0)
+                self._write_indirect_object(stream, idnum, obj)
+
+        next_idnum = len(self._objects) + 1
+        for start in range(0, len(compressible), _OBJECTS_PER_OBJECT_STREAM):
+            objects = compressible[start:start + _OBJECTS_PER_OBJECT_STREAM]
+            entries.update(
+                (idnum, (2, next_idnum, index)) for index, (idnum, _) in enumerate(objects)
+            )
+            entries[next_idnum] = (1, stream.tell(), 0)
+            self._write_indirect_object(stream, next_idnum, self._create_object_stream(objects))
+            next_idnum += 1
+
+        entries[next_idnum] = (1, stream.tell(), 0)
+        free_objects = [idnum for idnum in range(1, next_idnum) if idnum not in entries]
+        for idnum, next_free in zip([0, *free_objects], [*free_objects, 0]):
+            entries[idnum] = (0, next_free, 1 if idnum else 65535)
+
+        xref_location = stream.tell()
+        stream.write(f"{next_idnum} 0 obj\n".encode())
+        self._create_cross_reference_stream(entries).write_to_stream(stream)
+        stream.write(f"\nendobj\nstartxref\n{xref_location}\n%%EOF\n".encode())
+
+    def _can_be_in_object_stream(self, obj: PdfObject) -> bool:
+        if isinstance(obj, StreamObject) or obj is self._encrypt_entry:
+            return False
+        # Signing tools replace the placeholders of a signature within the file.
+        return not (isinstance(obj, DictionaryObject) and "/ByteRange" in obj)
+
+    @staticmethod
+    def _create_object_stream(objects: list[tuple[int, PdfObject]]) -> StreamObject:
+        offsets = []
+        data = BytesIO()
+        for idnum, obj in objects:
+            offsets.append(f"{idnum} {data.tell()}")
+            obj.write_to_stream(data)
+            data.write(b"\n")
+        header = " ".join(offsets).encode() + b"\n"
+
+        object_stream = DecodedStreamObject()
+        object_stream[NameObject("/Type")] = NameObject("/ObjStm")
+        object_stream[NameObject("/N")] = NumberObject(len(objects))
+        object_stream[NameObject("/First")] = NumberObject(len(header))
+        object_stream.set_data(header + data.getvalue())
+        return object_stream.flate_encode(level=9)
+
+    def _create_cross_reference_stream(self, entries: dict[int, tuple[int, int, int]]) -> StreamObject:
+        field_size = (max(entry[1] for entry in entries.values()).bit_length() + 7) // 8
+        row_size = 1 + field_size + 2
+
+        # The rows hardly differ, so the PNG "Up" predictor makes them compress well.
+        data = bytearray()
+        previous_row = bytes(row_size)
+        for idnum in sorted(entries):
+            entry_type, field2, field3 = entries[idnum]
+            row = bytes((entry_type, *field2.to_bytes(field_size, "big"), *field3.to_bytes(2, "big")))
+            data.append(2)
+            data.extend((byte - previous_byte) & 0xFF for byte, previous_byte in zip(row, previous_row))
+            previous_row = row
+
+        xref_stream = DecodedStreamObject()
+        xref_stream.update(self._get_trailer_entries())
+        xref_stream[NameObject(TK.SIZE)] = NumberObject(len(entries))
+        xref_stream[NameObject("/Type")] = NameObject("/XRef")
+        xref_stream[NameObject("/W")] = ArrayObject(
+            [NumberObject(1), NumberObject(field_size), NumberObject(2)]
+        )
+        xref_stream.set_data(bytes(data))
+        encoded_stream = xref_stream.flate_encode(level=9)
+        encoded_stream[NameObject("/DecodeParms")] = DictionaryObject(
+            {NameObject("/Columns"): NumberObject(row_size), NameObject("/Predictor"): NumberObject(12)}
+        )
+        return encoded_stream
 
     def _write_xref_table(
         self, stream: StreamType, object_positions: list[int], free_objects: list[int]
@@ -1568,6 +1671,10 @@ class PdfWriter(PdfDocCommon):
             of certain special objects within the body of the file.
         """
         stream.write(b"trailer\n")
+        self._get_trailer_entries().write_to_stream(stream)
+        stream.write(f"\nstartxref\n{xref_location}\n%%EOF\n".encode())  # eof
+
+    def _get_trailer_entries(self) -> DictionaryObject:
         trailer = DictionaryObject(
             {
                 NameObject(TK.SIZE): NumberObject(len(self._objects) + 1),
@@ -1580,8 +1687,7 @@ class PdfWriter(PdfDocCommon):
             trailer[NameObject(TK.ID)] = self._ID
         if self._encrypt_entry:
             trailer[NameObject(TK.ENCRYPT)] = self._encrypt_entry.indirect_reference
-        trailer.write_to_stream(stream)
-        stream.write(f"\nstartxref\n{xref_location}\n%%EOF\n".encode())  # eof
+        return trailer
 
     @property
     def metadata(self) -> DocumentInformation | None:

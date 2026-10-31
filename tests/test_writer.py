@@ -19,6 +19,7 @@ from pypdf import (
     PdfWriter,
     Transformation,
 )
+from pypdf._crypt_providers import crypt_provider
 from pypdf._utils import get_stream_data
 from pypdf._writer import _MAX_MERGE_ROUNDS
 from pypdf.annotations import Link
@@ -4205,3 +4206,139 @@ def test_find_outline_item__cyclic(name: str) -> None:
 
     with pytest.raises(expected_exception=LimitReachedError, match=r"^Detected cyclic outline hierarchy\.$"):
         writer.find_outline_item("Dummy")
+
+
+def _write_with_object_streams(writer: PdfWriter) -> BytesIO:
+    writer.use_object_streams = True
+    output = BytesIO()
+    writer.write(output)
+    return output
+
+
+def test_use_object_streams():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    writer.pdf_header = "%PDF-1.3"
+    writer.add_metadata({"/Title": "Stored in an object stream"})
+    expected_text = writer.pages[0].extract_text()
+
+    output = _write_with_object_streams(writer)
+
+    data = output.getvalue()
+    assert data.startswith(b"%PDF-1.5\n")
+    assert b"/Type /ObjStm" in data
+    assert b"/Type /XRef" in data
+    assert b"\nxref\n" not in data
+    assert b"\ntrailer\n" not in data
+    assert b"/Type /Catalog" not in data
+    assert writer.pdf_header == "%PDF-1.3"
+
+    written = PdfReader(output, strict=True)
+    assert written.pages[0].extract_text() == expected_text
+    assert written.metadata.title == "Stored in an object stream"
+    assert written.root_object.indirect_reference.idnum in written.xref_objStm
+
+
+def test_use_object_streams__keeps_higher_version():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    writer.pdf_header = "%PDF-1.7"
+    assert _write_with_object_streams(writer).getvalue().startswith(b"%PDF-1.7\n")
+
+
+def test_use_object_streams__many_objects():
+    """Object streams stay small, and object numbers can need more than one byte."""
+    writer = PdfWriter()
+    writer.add_blank_page(width=100, height=100)
+    references = [
+        writer._add_object(DictionaryObject({NameObject("/Number"): NumberObject(number)}))
+        for number in range(1000)
+    ]
+    writer.root_object[NameObject("/TestObjects")] = ArrayObject(references)
+
+    written = PdfReader(_write_with_object_streams(writer), strict=True)
+
+    numbers = [reference.get_object()["/Number"] for reference in written.root_object["/TestObjects"]]
+    assert numbers == list(range(1000))
+    assert len({number for number, _ in written.xref_objStm.values()}) == 11
+
+
+def test_use_object_streams__free_objects():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    unused = [writer._add_object(DictionaryObject()) for _ in range(3)]
+    for reference in unused:
+        writer._objects[reference.idnum - 1] = None
+
+    output = _write_with_object_streams(writer)
+
+    written = PdfReader(output, strict=True)
+    assert len(written.pages) == 1
+    for reference in unused:
+        assert reference.idnum not in written.xref_objStm
+        assert reference.idnum not in written.xref[0]
+
+
+def test_use_object_streams__keeps_signatures_uncompressed():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    signature = writer._add_object(
+        DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Sig"),
+                NameObject("/ByteRange"): ArrayObject([NumberObject(0)] * 4),
+            }
+        )
+    )
+    writer.root_object[NameObject("/TestSignature")] = signature
+
+    output = _write_with_object_streams(writer)
+
+    assert b"/ByteRange" in output.getvalue()
+    assert signature.idnum not in PdfReader(output).xref_objStm
+
+
+def test_use_object_streams__writes_the_same_again():
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    object_count = len(writer._objects)
+    assert _write_with_object_streams(writer).getvalue() == _write_with_object_streams(writer).getvalue()
+    assert len(writer._objects) == object_count
+
+
+def test_use_object_streams__not_for_incremental_updates():
+    writer = PdfWriter(RESOURCE_ROOT / "crazyones.pdf", incremental=True)
+    writer.add_metadata({"/Title": "Changed"})
+    output = _write_with_object_streams(writer)
+    assert b"/Type /ObjStm" not in output.getvalue()
+    assert PdfReader(output).metadata.title == "Changed"
+
+
+def test_use_object_streams__read_by_incremental_writer():
+    output = _write_with_object_streams(PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf"))
+    writer = PdfWriter(output, incremental=True)
+    writer.add_metadata({"/Title": "Changed"})
+    updated = BytesIO()
+    writer.write(updated)
+    assert PdfReader(updated).metadata.title == "Changed"
+
+
+@pytest.mark.parametrize(
+    "algorithm",
+    [
+        "RC4-40",
+        "RC4-128",
+        pytest.param("AES-128", marks=pytest.mark.skipif(crypt_provider[0] == "local_crypt_fallback", reason="No AES")),
+        pytest.param("AES-256", marks=pytest.mark.skipif(crypt_provider[0] == "local_crypt_fallback", reason="No AES")),
+    ],
+)
+def test_use_object_streams__encryption(algorithm):
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    writer.add_metadata({"/Title": "A secret title"})
+    expected_text = writer.pages[0].extract_text()
+    writer.encrypt("password", algorithm=algorithm)
+
+    output = _write_with_object_streams(writer)
+
+    data = output.getvalue()
+    assert b"A secret title" not in data
+    assert b"/Filter /Standard" in data
+    assert b"/Type /ObjStm" in data
+    reader = PdfReader(output, password="password", strict=True)
+    assert reader.metadata.title == "A secret title"
+    assert reader.pages[0].extract_text() == expected_text

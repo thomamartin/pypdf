@@ -54,7 +54,7 @@ else:
 from ._doc_common import DocumentInformation, PdfDocCommon
 from ._encryption import EncryptAlgorithm, Encryption
 from ._font_compression import remove_unused_font_tables
-from ._image_palette import use_palette
+from ._image_palette import use_group4, use_palette
 from ._jpeg_optimization import is_available as jpeg_optimization_is_available
 from ._jpeg_optimization import optimize_jpegs
 from ._page import PageObject, Transformation
@@ -1942,7 +1942,7 @@ class PdfWriter(PdfDocCommon):
                 continue
             if isinstance(obj, EncodedStreamObject):
                 use_palette(obj, level)
-                if not obj._add_png_predictor(level):
+                if not use_group4(obj) and not obj._add_png_predictor(level):
                     obj._recompress_flate(level)
             elif StreamAttributes.FILTER not in obj:
                 encoded = obj.flate_encode(level)

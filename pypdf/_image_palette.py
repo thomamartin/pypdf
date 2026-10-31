@@ -1,16 +1,30 @@
-"""Lossless storage of RGB images with few colors, for :meth:`PdfWriter.compress<pypdf.PdfWriter.compress>`."""
+"""Lossless storage of images with few colors, for :meth:`PdfWriter.compress<pypdf.PdfWriter.compress>`."""
 
+from io import BytesIO
 from itertools import islice
-from typing import cast
+from typing import Any, cast
 
 from .constants import ImageAttributes as IA
 from .constants import StreamAttributes as SA
 from .filters import FlateDecode
-from .generic import ArrayObject, ByteStringObject, DictionaryObject, EncodedStreamObject, NameObject, NumberObject
+from .generic import (
+    ArrayObject,
+    BooleanObject,
+    ByteStringObject,
+    DictionaryObject,
+    EncodedStreamObject,
+    NameObject,
+    NumberObject,
+)
 
 _CHUNK_SIZE = 65536
 _SAMPLE_SIZE = 256 * 1024
+_GROUP4_DICTIONARY_SIZE = 60
 _MAXIMUM_COLORS = 256
+_TIFF_FILL_ORDER = 266
+_TIFF_ROWS_PER_STRIP = 278
+_TIFF_STRIP_BYTE_COUNTS = 279
+_TIFF_STRIP_OFFSETS = 273
 _RGB_COLOR_SPACES = ("/DeviceRGB", "/CalRGB")
 
 
@@ -129,5 +143,75 @@ def use_palette(stream: EncodedStreamObject, level: int) -> bool:
             NumberObject(len(colors) - 1),
             ByteStringObject(bytes(value for color in colors for value in color)),
         ]
+    )
+    return True
+
+
+def _read_single_strip(tiff_file: BytesIO) -> bytes | None:
+    from PIL import Image  # noqa: PLC0415
+
+    with Image.open(tiff_file) as tiff:
+        tags = cast(Any, tiff).tag_v2
+        offsets = tags[_TIFF_STRIP_OFFSETS]
+        sizes = tags[_TIFF_STRIP_BYTE_COUNTS]
+        fill_order = tags.get(_TIFF_FILL_ORDER, 1)
+    if len(offsets) != 1 or fill_order != 1:
+        return None
+    return tiff_file.getvalue()[offsets[0]:offsets[0] + sizes[0]]
+
+
+def _encode_group4(data: bytes, width: int, height: int) -> bytes | None:
+    """Get CCITT group 4 data for 1-bit pixels, if Pillow can create it."""
+    try:
+        from PIL import Image  # noqa: PLC0415
+    except ImportError:
+        return None
+    output = BytesIO()
+    try:
+        Image.frombytes("1", (width, height), data).save(
+            output, "TIFF", compression="group4", tiffinfo={_TIFF_ROWS_PER_STRIP: height}
+        )
+    except (OSError, ValueError, KeyError):
+        return None
+    return _read_single_strip(output)
+
+
+def use_group4(stream: EncodedStreamObject) -> bool:
+    """
+    Store a Flate-encoded image with 1 bit per pixel with CCITT group 4 if that makes it smaller.
+
+    Args:
+        stream: The image.
+
+    Returns:
+        True if the stream has a new encoding.
+
+    """
+    width, height = stream.get(IA.WIDTH), stream.get(IA.HEIGHT)
+    bits = 1 if stream.get(IA.IMAGE_MASK) else stream.get(IA.BITS_PER_COMPONENT)
+    if (
+        stream.get("/Subtype") != "/Image"
+        or bits != 1
+        or not (isinstance(width, int) and isinstance(height, int) and width > 0 and height > 0)
+        or SA.DECODE_PARMS in stream
+        or not stream._is_only_flate_encoded()
+    ):
+        return False
+    data = stream._decode_flate_exactly()
+    if data is None or len(data) != height * ((width + 7) // 8):
+        return False
+    encoded = _encode_group4(data, width, height)
+    if encoded is None or len(encoded) + _GROUP4_DICTIONARY_SIZE >= len(stream._data):
+        return False
+    stream._data = encoded
+    stream.decoded_self = None
+    stream[NameObject(SA.FILTER)] = NameObject("/CCITTFaxDecode")
+    stream[NameObject(SA.DECODE_PARMS)] = DictionaryObject(
+        {
+            NameObject("/BlackIs1"): BooleanObject(True),
+            NameObject("/Columns"): NumberObject(width),
+            NameObject("/K"): NumberObject(-1),
+            NameObject("/Rows"): NumberObject(height),
+        }
     )
     return True

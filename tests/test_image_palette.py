@@ -1,13 +1,16 @@
 """Test the storage of images with few colors."""
 
+import sys
 import zlib
 from io import BytesIO
 from typing import cast
+from unittest import mock
 
 import pytest
+from PIL import Image
 
 from pypdf import PdfReader, PdfWriter
-from pypdf._image_palette import is_rgb, use_palette
+from pypdf._image_palette import _read_single_strip, is_rgb, use_group4, use_palette
 from pypdf.generic import (
     ArrayObject,
     BooleanObject,
@@ -234,3 +237,103 @@ def test_compress__removes_thumbnails():
 
     assert "/Thumb" not in writer.pages[0]
     assert writer._objects[thumbnail.idnum - 1] is None
+
+
+def _scan(width: int, height: int) -> bytes:
+    """Dark marks like those of a scanned page, which CCITT stores well."""
+    rows = bytearray()
+    state = 12345
+    marks = []
+    for _ in range(600):
+        state = (state * 1103515245 + 12345) % 2**31
+        marks.append((state % width, (state >> 12) % height, 2 + state % 5, 3 + (state >> 7) % 9))
+    for y in range(height):
+        row = (1 << width) - 1
+        for left, top, mark_width, mark_height in marks:
+            if top <= y < top + mark_height:
+                row &= ~(((1 << mark_width) - 1) << max(0, width - left - mark_width))
+        padding = -width % 8
+        rows += ((row & ((1 << width) - 1)) << padding).to_bytes((width + padding) // 8, "big")
+    return bytes(rows)
+
+
+def _bilevel_stream(data: bytes, width: int, height: int) -> EncodedStreamObject:
+    stream = _stream(data, width, height)
+    stream[NameObject("/BitsPerComponent")] = NumberObject(1)
+    stream[NameObject("/ColorSpace")] = NameObject("/DeviceGray")
+    return stream
+
+
+def test_use_group4():
+    data = _scan(603, 500)
+    stream = _bilevel_stream(data, 603, 500)
+    size_before = len(stream._data)
+
+    assert use_group4(stream) is True
+
+    assert len(stream._data) < size_before
+    assert stream["/Filter"] == "/CCITTFaxDecode"
+    assert stream["/DecodeParms"] == {"/K": -1, "/Columns": 603, "/Rows": 500, "/BlackIs1": True}
+
+
+def test_use_group4__image_mask():
+    data = _scan(600, 500)
+    stream = _bilevel_stream(data, 600, 500)
+    del stream["/BitsPerComponent"]
+    del stream["/ColorSpace"]
+    stream[NameObject("/ImageMask")] = BooleanObject(True)
+
+    assert use_group4(stream) is True
+
+    assert stream["/ImageMask"] is not None
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("/BitsPerComponent", NumberObject(8)),
+        ("/DecodeParms", DictionaryObject()),
+        ("/Filter", NameObject("/DCTDecode")),
+        ("/Subtype", NameObject("/Form")),
+        ("/Width", NumberObject(0)),
+    ],
+)
+def test_use_group4__keeps_other_images(key, value):
+    stream = _bilevel_stream(_scan(600, 500), 600, 500)
+    stream[NameObject(key)] = value
+    assert use_group4(stream) is False
+
+
+def test_use_group4__keeps_broken_data():
+    stream = _bilevel_stream(_scan(600, 500), 600, 500)
+    stream._data = stream._data[:-20]
+    assert use_group4(stream) is False
+    assert use_group4(_bilevel_stream(b"too short", 600, 500)) is False
+
+
+def test_use_group4__keeps_images_which_flate_stores_better():
+    stream = _bilevel_stream(bytes(75 * 500), 600, 500)
+    assert use_group4(stream) is False
+    assert stream["/Filter"] == "/FlateDecode"
+
+
+def test_use_group4__needs_pillow():
+    stream = _bilevel_stream(_scan(600, 500), 600, 500)
+    with mock.patch.dict(sys.modules, {"PIL": None}):
+        assert use_group4(stream) is False
+
+
+def test_use_group4__needs_a_single_strip():
+    output = BytesIO()
+    Image.frombytes("1", (600, 500), _scan(600, 500)).save(
+        output, "TIFF", compression="group4", tiffinfo={278: 100}
+    )
+    assert _read_single_strip(output) is None
+
+
+def test_use_group4__needs_the_usual_bit_order():
+    output = BytesIO()
+    Image.frombytes("1", (600, 500), _scan(600, 500)).save(
+        output, "TIFF", compression="group4", tiffinfo={278: 500, 266: 2}
+    )
+    assert _read_single_strip(output) is None

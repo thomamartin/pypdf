@@ -221,6 +221,12 @@ def test_encrypt_decrypt_with_cipher_class(cryptcls):
     assert crypt.decrypt(crypt.encrypt(message)) == message
 
 
+def test_fallback_rc4__known_answer():
+    """The key stream of the fallback matches the test vector of RFC 6229."""
+    crypt = pypdf._crypt_providers._fallback.CryptRC4(bytes.fromhex("0102030405"))
+    assert crypt.encrypt(bytes(16)).hex() == "b2396305f03dc027ccc3524a0a1118a8"
+
+
 @pytest.mark.parametrize(("idnum", "low_three_bytes"), [(2**31, 0), (2**32 + 1, 1), (0x01020304, 0x020304)])
 def test_make_crypt_filter_large_object_number(idnum, low_three_bytes):
     """Object numbers above the signed 32-bit range use only their low-order three bytes."""

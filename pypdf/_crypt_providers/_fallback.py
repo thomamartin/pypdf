@@ -36,11 +36,12 @@ crypt_provider = ("local_crypt_fallback", "0.0.0")
 
 class CryptRC4(CryptBase):
     def __init__(self, key: bytes) -> None:
-        self.s = bytearray(range(256))
+        self.s = s = bytearray(range(256))
+        key_length = len(key)
         j = 0
         for i in range(256):
-            j = (j + self.s[i] + key[i % len(key)]) % 256
-            self.s[i], self.s[j] = self.s[j], self.s[i]
+            j = (j + s[i] + key[i % key_length]) % 256
+            s[i], s[j] = s[j], s[i]
 
     def encrypt(self, data: bytes) -> bytes:
         s = bytearray(self.s)
